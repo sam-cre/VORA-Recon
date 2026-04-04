@@ -1,0 +1,5 @@
+target/
+tauri-app/node_modules/
+tauri-app/src-tauri/target/
+*.exe
+!tauri-app/src-tauri/target/release/bundle/

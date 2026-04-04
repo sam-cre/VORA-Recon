@@ -1,0 +1,1 @@
+Auto-selected interface: \Device\NPF_{CFA5A114-39FD-48A9-B2F6-85ADD8C37C16}
