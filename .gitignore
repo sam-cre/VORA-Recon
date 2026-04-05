@@ -1,5 +1,27 @@
-target/
-tauri-app/node_modules/
-tauri-app/src-tauri/target/
+# Rust / Cargo
+/target
+Cargo.lock
+
+# Windows / IDEs
+.vs/
+.vscode/
+*.user
+*.suo
+*.sln
+*.pdb
+
+# Local Logs & Errors
+*.log
+*.txt
+stderr.txt
+stdout.txt
+
+# Binaries & Shared Files
 *.exe
-!tauri-app/src-tauri/target/release/bundle/
+*.manifest
+VoraRecon-Setup.exe
+!target/release/bundle/
+
+# Local Environment
+.env
+.DS_Store

@@ -8,7 +8,7 @@ mod process;
 
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, DisableMouseCapture};
@@ -33,59 +33,7 @@ struct Args {
     output: Option<String>,
 }
 
-#[cfg(target_os = "windows")]
-unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> winapi::shared::minwindef::BOOL {
-    if ctrl_type == winapi::um::wincon::CTRL_CLOSE_EVENT || ctrl_type == winapi::um::wincon::CTRL_C_EVENT {
-        execute!(std::io::stdout(), DisableMouseCapture).ok();
-        use winapi::um::winuser::{SetCursor, LoadCursorW, IDC_ARROW};
-        use std::ptr::null_mut;
-        SetCursor(LoadCursorW(null_mut(), IDC_ARROW));
-        ratatui::restore();
-        std::process::exit(0);
-    }
-    winapi::shared::minwindef::FALSE
-}
 
-#[cfg(target_os = "windows")]
-fn setup_console_handler() {
-    unsafe {
-        winapi::um::consoleapi::SetConsoleCtrlHandler(Some(console_ctrl_handler), winapi::shared::minwindef::TRUE);
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn maximize_console() {
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        unsafe {
-            use winapi::um::winuser::{SetCursor, LoadCursorW, IDC_ARROW};
-            use std::ptr::null_mut;
-            SetCursor(LoadCursorW(null_mut(), IDC_ARROW));
-
-            let hwnd = winapi::um::wincon::GetConsoleWindow();
-            if !hwnd.is_null() {
-                winapi::um::winuser::ShowWindow(hwnd, winapi::um::winuser::SW_MAXIMIZE);
-                winapi::um::winuser::UpdateWindow(hwnd);
-            }
-        }
-    });
-}
-
-#[cfg(target_os = "windows")]
-fn fix_console_mode() {
-    unsafe {
-        let handle = winapi::um::processenv::GetStdHandle(winapi::um::winbase::STD_INPUT_HANDLE);
-        if handle != winapi::um::handleapi::INVALID_HANDLE_VALUE {
-            let mut mode: u32 = 0;
-            if winapi::um::consoleapi::GetConsoleMode(handle, &mut mode) != 0 {
-                mode &= !winapi::um::wincon::ENABLE_QUICK_EDIT_MODE;
-                mode |= winapi::um::wincon::ENABLE_EXTENDED_FLAGS;
-                mode &= !winapi::um::wincon::ENABLE_WINDOW_INPUT;
-                winapi::um::consoleapi::SetConsoleMode(handle, mode);
-            }
-        }
-    }
-}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -155,21 +103,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mut terminal = ratatui::init();
-    execute!(std::io::stdout(), DisableMouseCapture).ok();
-
-    #[cfg(target_os = "windows")]
-    unsafe {
-        use winapi::um::winuser::{SetCursor, LoadCursorW, IDC_ARROW};
-        use std::ptr::null_mut;
-        SetCursor(LoadCursorW(null_mut(), IDC_ARROW));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        setup_console_handler();
-        maximize_console();
-        fix_console_mode();
-    }
 
     let result = run_app(&mut terminal, &args, rx, &mut log, resolved_iface_name);
     execute!(std::io::stdout(), DisableMouseCapture).ok();
@@ -193,6 +126,7 @@ fn run_app(
     
     let mut count: u64 = 0;
     let mut channel_alive = true;
+    let mut last_render = Instant::now();
 
     loop {
         state.tick();
@@ -211,17 +145,39 @@ fn run_app(
             }
         }
 
-        // Drain ALL pending packets from the channel before drawing
+        // Drain pending packets from the channel
         if channel_alive && !state.limit_reached {
+            let mut packets_this_tick = 0;
             loop {
+                // Limit the number of packets we process "at once" to ensure 
+                // the UI remains prioritized under extreme load.
+                if packets_this_tick >= 1000 {
+                    break;
+                }
+
                 match rx.try_recv() {
                     Ok(mut pkt) => {
-                        // Resolve process name from source port
+                        // Resolve process name from source port (with caching)
                         #[cfg(target_os = "windows")]
                         {
-                            pkt.process = pkt
-                                .src_port
-                                .and_then(|p| process::lookup_process(p, &pkt.protocol));
+                            if let Some(port) = pkt.src_port {
+                                let key = (port, pkt.protocol.clone());
+                                let mut needs_lookup = true;
+
+                                if let Some((cached_name, last_updated)) = state.process_cache.get(&key) {
+                                    if last_updated.elapsed() < Duration::from_secs(5) {
+                                        pkt.process = Some(cached_name.clone());
+                                        needs_lookup = false;
+                                    }
+                                }
+
+                                if needs_lookup {
+                                    if let Some(new_name) = process::lookup_process(port, &pkt.protocol) {
+                                        state.process_cache.insert(key, (new_name.clone(), Instant::now()));
+                                        pkt.process = Some(new_name);
+                                    }
+                                }
+                            }
                         }
 
                         // Logger always writes regardless of pause/filter
@@ -249,6 +205,7 @@ fn run_app(
                         }
 
                         count += 1;
+                        packets_this_tick += 1;
                         if let Some(limit) = args.limit {
                             if count >= limit {
                                 state.limit_reached = true;
@@ -267,16 +224,21 @@ fn run_app(
             }
         }
 
-        // Render once after draining
-        terminal.draw(|f| display::draw_ui(f, &state))?;
+        // --- Throttled Rendering ---
+        // Render at most 20 times per second (50ms interval)
+        if last_render.elapsed() >= Duration::from_millis(50) {
+            terminal.draw(|f| display::draw_ui(f, &state))?;
+            last_render = Instant::now();
+        }
 
-        // Handle keyboard input
-        if event::poll(Duration::from_millis(50))? {
+        // --- Event Draining ---
+        // Drain *all* pending keyboard events to ensure 'Q' is caught immediately
+        while event::poll(Duration::from_millis(0))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     match state.input_mode {
                         InputMode::Normal => match key.code {
-                            KeyCode::Char('q') | KeyCode::Char('Q') => break,
+                            KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(()),
                             KeyCode::Char('p') | KeyCode::Char('P') => {
                                 state.paused = !state.paused;
                             }
@@ -287,7 +249,7 @@ fn run_app(
                                 state.clear_alerts();
                             }
                             KeyCode::Char('e') | KeyCode::Char('E') => {
-                                state.input_buffer = r"C:\Users\SamRo\Documents\vora_report.txt".to_string();
+                            state.input_buffer = "vora_report.txt".to_string();
                                 state.input_mode = InputMode::Exporting;
                             }
                             KeyCode::Char('w') | KeyCode::Char('W') => {
@@ -334,9 +296,10 @@ fn run_app(
                 }
             }
         }
+        
+        // Brief sleep to avoid 100% CPU on a single core during low traffic
+        std::thread::sleep(Duration::from_millis(5));
     }
-
-    Ok(())
 }
 
 fn is_public_ip_heuristic(ip: &std::net::IpAddr) -> bool {

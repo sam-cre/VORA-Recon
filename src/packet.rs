@@ -18,7 +18,7 @@ pub enum ProtocolFilter {
     Icmp,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Eq, Hash, PartialEq)]
 #[allow(dead_code)] // Unknown(u8) reserved for future use
 pub enum Protocol {
     #[serde(rename = "TCP")]

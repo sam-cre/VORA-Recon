@@ -107,6 +107,7 @@ pub struct AppState {
     pub geo_cache: HashMap<IpAddr, crate::geoip::GeoInfo>,
     pub geo_in_flight: usize,
     pub footer_message: Option<(String, std::time::Instant)>,
+    pub process_cache: HashMap<(u16, Protocol), (String, std::time::Instant)>,
 }
 
 const KNOWN_PORTS: [u16; 16] = [
@@ -153,6 +154,7 @@ impl AppState {
             geo_cache: HashMap::new(),
             geo_in_flight: 0,
             footer_message: None,
+            process_cache: HashMap::new(),
         }
     }
 

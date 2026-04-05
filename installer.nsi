@@ -74,6 +74,10 @@ Section "Vora Recon" SecMain
     File "target\release\vora-recon.exe"
     File "target\release\launcher.exe"
 
+    ; Copy Optimization scripts
+    File "Optimize-Vora.ps1"
+    File "VoraPerformance.reg"
+
     ; Install Npcap if checkbox was checked
     ${If} $InstallNpcap == ${BST_CHECKED}
         DetailPrint "Downloading Npcap..."
@@ -92,6 +96,10 @@ Section "Vora Recon" SecMain
         ${EndIf}
     ${EndIf}
 
+    ; Automatically apply performance optimizations
+    DetailPrint "Applying performance optimizations..."
+    ExecWait 'regedit.exe /s "$INSTDIR\VoraPerformance.reg"'
+
     ; Create desktop shortcut
     CreateShortcut "$DESKTOP\Vora Recon.lnk" "$INSTDIR\launcher.exe" "" "$INSTDIR\vora-recon.exe"
 
@@ -105,7 +113,7 @@ Section "Vora Recon" SecMain
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "DisplayName" "Vora Recon"
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "UninstallString" '"$INSTDIR\Uninstall.exe"'
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "DisplayVersion" "0.4.0"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "Publisher" "Kael Riven"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "Publisher" "Sam Rogers"
     WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "NoModify" 1
     WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "NoRepair" 1
 
