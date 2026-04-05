@@ -70,8 +70,9 @@ Section "Vora Recon" SecMain
 
     SetOutPath "$INSTDIR"
 
-    ; Copy the main executable
+    ; Copy the main executables
     File "target\release\vora-recon.exe"
+    File "target\release\launcher.exe"
 
     ; Install Npcap if checkbox was checked
     ${If} $InstallNpcap == ${BST_CHECKED}
@@ -91,18 +92,12 @@ Section "Vora Recon" SecMain
         ${EndIf}
     ${EndIf}
 
-    ; Create launch.vbs
-    FileOpen $0 "$INSTDIR\launch.vbs" w
-    FileWrite $0 'Set UAC = CreateObject("Shell.Application")$\r$\n'
-    FileWrite $0 'UAC.ShellExecute "wt.exe", "-d """ & CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName) & """ """ & CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName) & "\vora-recon.exe""", "", "runas", 1$\r$\n'
-    FileClose $0
-
     ; Create desktop shortcut
-    CreateShortcut "$DESKTOP\Vora Recon.lnk" "$WINDIR\System32\wscript.exe" '"$INSTDIR\launch.vbs"' "$INSTDIR\vora-recon.exe"
+    CreateShortcut "$DESKTOP\Vora Recon.lnk" "$INSTDIR\launcher.exe" "" "$INSTDIR\vora-recon.exe"
 
     ; Create start menu entry
     CreateDirectory "$SMPROGRAMS\VoraRecon"
-    CreateShortcut "$SMPROGRAMS\VoraRecon\Vora Recon.lnk" "$WINDIR\System32\wscript.exe" '"$INSTDIR\launch.vbs"' "$INSTDIR\vora-recon.exe"
+    CreateShortcut "$SMPROGRAMS\VoraRecon\Vora Recon.lnk" "$INSTDIR\launcher.exe" "" "$INSTDIR\vora-recon.exe"
     CreateShortcut "$SMPROGRAMS\VoraRecon\Uninstall.lnk" "$INSTDIR\Uninstall.exe"
 
     ; Write registry keys for uninstaller
@@ -125,7 +120,7 @@ SectionEnd
 Section "Uninstall"
 
     Delete "$INSTDIR\vora-recon.exe"
-    Delete "$INSTDIR\launch.vbs"
+    Delete "$INSTDIR\launcher.exe"
     Delete "$INSTDIR\Uninstall.exe"
     RMDir "$INSTDIR"
 
