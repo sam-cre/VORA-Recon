@@ -27,12 +27,19 @@
 ## Global Keybinds
 
 | `Q` | **Quit** the application immediately |
+
 | `P` | **Pause/Resume** the live feed |
+
 | `F` | **Cycle Filters** (Live Feed: TCP/UDP/ICMP | Alerts: Suspicious/External/Noise) |
+
 | `C` | **Clear Alerts** log |
+
 | `E` | **Export Report** to a text file |
+
 | `W` | **Whitelist IP** address manually |
+
 | `Tab` | Switch between Live Feed and Alerts panel |
+
 | `Up/Down`| Scroll through the packet history |
 
 ## Building from Source
