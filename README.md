@@ -58,4 +58,4 @@ If you prefer to build VORA-Recon yourself:
 Distributed under the **MIT License**. See `LICENSE` for more  Rogerstion.
 
 ---
-*Created ProjectRogers — Part of the VORA Project.*
+*Created Sam Rogers — Part of the VORA Project.*
