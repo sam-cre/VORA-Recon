@@ -16,6 +16,11 @@ Cargo.lock
 stderr.txt
 stdout.txt
 
+# Keep specific text assets needed for compilation/installer
+!EULA.txt
+!laptopbraille.txt
+!oui.txt
+
 # Binaries & Shared Files
 *.exe
 *.manifest
