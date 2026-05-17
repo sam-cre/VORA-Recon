@@ -6,6 +6,8 @@ use std::thread;
 #[derive(Clone, Debug)]
 pub struct GeoInfo {
     pub country_code: String,
+    pub city: Option<String>,
+    pub region: Option<String>,
     pub org: String,
 }
 
@@ -14,6 +16,8 @@ pub struct GeoInfo {
 struct IpApiResponse {
     status: String,
     countryCode: Option<String>,
+    region: Option<String>,
+    city: Option<String>,
     org: Option<String>,
 }
 
@@ -24,7 +28,7 @@ pub fn start_geo_thread(
     thread::spawn(move || {
         // Iterate blocking on incoming IP requests
         for ip in req_rx {
-            let url = format!("http://ip-api.com/json/{}?fields=status,countryCode,org", ip);
+            let url = format!("http://ip-api.com/json/{}?fields=status,countryCode,region,city,org", ip);
             
             let result = ureq::get(&url)
                 .timeout(std::time::Duration::from_secs(3))
@@ -36,6 +40,8 @@ pub fn start_geo_thread(
                         if data.status == "success" {
                             let info = GeoInfo {
                                 country_code: data.countryCode.unwrap_or_else(|| "??".to_string()),
+                                city: data.city,
+                                region: data.region,
                                 org: data.org.unwrap_or_else(|| "Unknown".to_string()),
                             };
                             let _ = res_tx.send((ip, Some(info)));
@@ -54,7 +60,7 @@ pub fn start_geo_thread(
 
             // Respect free API limits (45 req / minute => ~1.33 seconds per req)
             // By doing sequential blocking we rate limit naturally, but a short sleep is kind
-            thread::sleep(std::time::Duration::from_millis(500));
+            thread::sleep(std::time::Duration::from_millis(200));
         }
     });
 }

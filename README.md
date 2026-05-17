@@ -6,12 +6,12 @@
 
 ## Features
 
-- **Real-time TUI Dashboard**: A very dense user interface built using ratatui, that will present you with a wealth of information, in real time.
-- **Process Identification**: Each incoming and outgoing packet is automatically associated with the specific Windows process (PID and process name) that owns the connection.
-- **GeoIP Forensics**: Geolocation of remote IP addresses immediately allows you to identify any international traffic that you find suspicious.
-- **Smart Alerts**: An alert system is built in that includes rules that will alert you to abnormal connection activity, pings from the outside, and system noise.
-- **JSON Logging**: All logs are machine readable (JSON) so that they can be used for later analysis, and they will be stored locally on your machine persistently.
-- **Zero Configuration Optimization**: Includes the ability to set up Windows for optimal high-speed packet capture with a single click via PowerShell.
+**Real-time TUI Dashboard**: A very dense user interface built using ratatui, that will present you with a wealth of information, in real time.
+**Process Identification**: Each incoming and outgoing packet is automatically associated with the specific Windows process (PID and process name) that owns the connection.
+**GeoIP Forensics**: Geolocation of remote IP addresses immediately allows you to identify any international traffic that you find suspicious.
+**Smart Alerts**: An alert system is built in that includes rules that will alert you to abnormal connection activity, pings from the outside, and system noise.
+**JSON Logging**: All logs are machine readable (JSON) so that they can be used for later analysis, and they will be stored locally on your machine persistently.
+**Zero Configuration Optimization**: Includes the ability to set up Windows for optimal high-speed packet capture with a single click via PowerShell.
 
 ## Installation
 

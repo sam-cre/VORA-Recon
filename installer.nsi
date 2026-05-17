@@ -5,8 +5,8 @@
 ; ═══════════════════════════════════════
 ; BASIC INFO
 ; ═══════════════════════════════════════
-Name "Vora Recon"
-OutFile "VoraRecon-Setup.exe"
+Name "VORA-Recon"
+OutFile "VORA-Recon-Setup.exe"
 InstallDir "$PROGRAMFILES64\VoraRecon"
 InstallDirRegKey HKLM "Software\VoraRecon" "Install_Dir"
 RequestExecutionLevel admin
@@ -15,16 +15,20 @@ RequestExecutionLevel admin
 ; MODERN UI SETTINGS
 ; ═══════════════════════════════════════
 !define MUI_ABORTWARNING
-!define MUI_ICON "${NSISDIR}\Contrib\Graphics\Icons\modern-install.ico"
-!define MUI_UNICON "${NSISDIR}\Contrib\Graphics\Icons\modern-uninstall.ico"
-!define MUI_WELCOMEPAGE_TITLE "Welcome to Vora Recon Setup"
-!define MUI_WELCOMEPAGE_TEXT "Vora Recon is a terminal-native network monitoring tool.$\r$\n$\r$\nThis installer will:$\r$\n  - Install Vora Recon on your system$\r$\n  - Check for Npcap (required for packet capture)$\r$\n  - Create a desktop shortcut$\r$\n$\r$\nClick Next to continue."
+!define MUI_ICON "assets\logo.ico"
+!define MUI_UNICON "assets\logo.ico"
+!define MUI_WELCOMEPAGE_TITLE "Welcome to VORA-Recon Setup"
+!define MUI_WELCOMEPAGE_TEXT "VORA-Recon is a terminal-native network monitoring tool.$\r$\n$\r$\nThis installer will:$\r$\n  - Install VORA-Recon on your system$\r$\n  - Check for Npcap (required for packet capture)$\r$\n$\r$\nClick Next to continue."
 
 ; Pages
 !insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_LICENSE "EULA.txt"
 !insertmacro MUI_PAGE_DIRECTORY
 Page custom NpcapPage NpcapPageLeave
 !insertmacro MUI_PAGE_INSTFILES
+!define MUI_FINISHPAGE_SHOWREADME ""
+!define MUI_FINISHPAGE_SHOWREADME_TEXT "Create Desktop Shortcut"
+!define MUI_FINISHPAGE_SHOWREADME_FUNCTION CreateDesktopShortcut
 !insertmacro MUI_PAGE_FINISH
 
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -49,7 +53,7 @@ Function NpcapPage
     nsDialogs::Create 1018
     Pop $0
 
-    ${NSD_CreateLabel} 0 0 100% 40u "Npcap is required for Vora Recon to capture network packets.$\r$\nIt was not detected on your system."
+    ${NSD_CreateLabel} 0 0 100% 40u "Npcap is required for VORA-Recon to capture network packets.$\r$\nIt was not detected on your system."
     Pop $0
 
     ${NSD_CreateCheckbox} 0 50u 100% 12u "Download and install Npcap automatically (recommended)"
@@ -66,7 +70,13 @@ FunctionEnd
 ; ═══════════════════════════════════════
 ; INSTALLER SECTION
 ; ═══════════════════════════════════════
-Section "Vora Recon" SecMain
+Section "VORA-Recon" SecMain
+    
+    ; Ensure processes are closed before installing
+    DetailPrint "Closing running instances..."
+    nsExec::Exec 'taskkill /F /IM vora-recon.exe /T'
+    nsExec::Exec 'taskkill /F /IM launcher.exe /T'
+    Sleep 500
 
     SetOutPath "$INSTDIR"
 
@@ -77,6 +87,13 @@ Section "Vora Recon" SecMain
     ; Copy Optimization scripts
     File "Optimize-Vora.ps1"
     File "VoraPerformance.reg"
+
+    ; Copy Assets (icon, etc.)
+    SetOutPath "$INSTDIR\assets"
+    File "assets\logo.ico"
+    File "assets\logo.png"
+
+    SetOutPath "$INSTDIR"
 
     ; Install Npcap if checkbox was checked
     ${If} $InstallNpcap == ${BST_CHECKED}
@@ -100,17 +117,19 @@ Section "Vora Recon" SecMain
     DetailPrint "Applying performance optimizations..."
     ExecWait 'regedit.exe /s "$INSTDIR\VoraPerformance.reg"'
 
-    ; Create desktop shortcut
-    CreateShortcut "$DESKTOP\Vora Recon.lnk" "$INSTDIR\launcher.exe" "" "$INSTDIR\vora-recon.exe"
+    ; Cleanup any old shortcut variants
+    Delete "$DESKTOP\Vora Recon.lnk"
+    Delete "$DESKTOP\VORA-RECON.lnk"
+    Delete "$DESKTOP\VORA-Recon.lnk"
 
     ; Create start menu entry
     CreateDirectory "$SMPROGRAMS\VoraRecon"
-    CreateShortcut "$SMPROGRAMS\VoraRecon\Vora Recon.lnk" "$INSTDIR\launcher.exe" "" "$INSTDIR\vora-recon.exe"
+    CreateShortcut "$SMPROGRAMS\VoraRecon\VORA-Recon.lnk" "$INSTDIR\launcher.exe" "" "$INSTDIR\assets\logo.ico"
     CreateShortcut "$SMPROGRAMS\VoraRecon\Uninstall.lnk" "$INSTDIR\Uninstall.exe"
 
     ; Write registry keys for uninstaller
     WriteRegStr HKLM "Software\VoraRecon" "Install_Dir" "$INSTDIR"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "DisplayName" "Vora Recon"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "DisplayName" "VORA-Recon"
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "UninstallString" '"$INSTDIR\Uninstall.exe"'
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "DisplayVersion" "0.4.0"
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "Publisher" "Sam Rogers"
@@ -130,9 +149,16 @@ Section "Uninstall"
     Delete "$INSTDIR\vora-recon.exe"
     Delete "$INSTDIR\launcher.exe"
     Delete "$INSTDIR\Uninstall.exe"
+    Delete "$INSTDIR\assets\logo.ico"
+    Delete "$INSTDIR\assets\logo.png"
+    RMDir "$INSTDIR\assets"
     RMDir "$INSTDIR"
 
+    Delete "$DESKTOP\VORA-RECON.lnk"
+    Delete "$DESKTOP\VORA-Recon.lnk"
     Delete "$DESKTOP\Vora Recon.lnk"
+    Delete "$SMPROGRAMS\VoraRecon\VORA-RECON.lnk"
+    Delete "$SMPROGRAMS\VoraRecon\VORA-Recon.lnk"
     Delete "$SMPROGRAMS\VoraRecon\Vora Recon.lnk"
     Delete "$SMPROGRAMS\VoraRecon\Uninstall.lnk"
     RMDir "$SMPROGRAMS\VoraRecon"
@@ -141,3 +167,10 @@ Section "Uninstall"
     DeleteRegKey HKLM "Software\VoraRecon"
 
 SectionEnd
+
+Function CreateDesktopShortcut
+    Delete "$DESKTOP\VORA-Recon.lnk"
+    Delete "$DESKTOP\VORA-RECON.lnk"
+    Delete "$DESKTOP\Vora Recon.lnk"
+    CreateShortcut "$DESKTOP\VORA-Recon.lnk" "$INSTDIR\launcher.exe" "" "$INSTDIR\assets\logo.ico"
+FunctionEnd

@@ -1,6 +1,6 @@
 [package]
 name = "vora-recon"
-version = "0.4.0"
+version = "2.0.0"
 edition = "2021"
 
 [[bin]]
@@ -21,11 +21,19 @@ ratatui = "0.29"
 ureq = { version = "2.9", features = ["json"] }
 unicode-truncate = "1"
 unicode-width = "0.2"
+dashmap = "6"
+oui = "0.7"
+dns-lookup = "1"
+socket2 = "0.5"
+regex = "1"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = [
     "wincon", "winuser", "shellapi", "consoleapi",
     "iphlpapi", "tcpmib", "udpmib",
     "processthreadsapi", "psapi", "handleapi",
-    "winnt", "ws2def",
+    "winnt", "ws2def", "netioapi",
 ] }
+
+[build-dependencies]
+winres = "0.1"
