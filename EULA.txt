@@ -1,0 +1,28 @@
+VORA-Recon - End User License Agreement (EULA)
+Author: Sam Rogers
+Copyright (c) 2026 Sam Rogers. All Rights Reserved.
+
+PLEASE READ THIS LICENSE AGREEMENT CAREFULLY BEFORE INSTALLING OR USING VORA-RECON. BY INSTALLING OR USING THE SOFTWARE, YOU AGREE TO BE BOUND BY THE TERMS OF THIS AGREEMENT.
+
+1. LICENSE GRANT
+Sam Rogers ("The Author") grants you a non-exclusive, non-transferable license to use VORA-Recon for educational, research, and personal network auditing purposes only.
+
+2. CONSENT TO SCANNING
+VORA-Recon includes active network discovery features (ARP/Ping Sweeping). By using these features, you warrant that you either own the network you are auditing or have explicit, written permission from the network owner to perform such activity. Unauthorized network enumeration may be illegal in your jurisdiction.
+
+3. NO WARRANTY
+VORA-RECON IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+4. LIMITATION OF LIABILITY
+THE AUTHOR SHALL NOT BE HELD LIABLE FOR ANY DAMAGES, DATA LOSS, LEGAL CONSEQUENCES, OR CRIMINAL CHARGES ARISING FROM THE USE OR MISUSE OF THIS SOFTWARE. THE USER ASSUMES ALL RISKS ASSOCIATED WITH NETWORK MONITORING AND DISCOVERY.
+
+5. COMPLIANCE WITH LAWS
+Users are solely responsible for ensuring their use of VORA-Recon complies with all applicable local, state, national, and international laws, including but not limited to the Computer Fraud and Abuse Act (CFAA) and the Computer Misuse Act.
+
+6. PROHIBITED USES
+You may not use VORA-Recon for any malicious purpose, including but not limited to:
+- Intercepting data on networks you do not own or have permission to audit.
+- Facilitating unauthorized access to computer systems.
+- Disrupting network services.
+
+BY CLICKING "I AGREE" OR INSTALLING THE SOFTWARE, YOU ACKNOWLEDGE THAT YOU HAVE READ THIS AGREEMENT, UNDERSTAND IT, AND AGREE TO BE BOUND BY ITS TERMS AND CONDITIONS.
