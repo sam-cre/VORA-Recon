@@ -70,6 +70,12 @@ pub struct CapturedPacket {
     /// Format: comma-separated option codes, e.g. "1,3,6,15,119,252"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dhcp_fingerprint: Option<String>,
+    /// DHCP Option 12 hostname announced by the device in its DHCP request
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dhcp_hostname: Option<String>,
+    /// The device's IP extracted from DHCP ciaddr or Option 50 (used when src_ip is 0.0.0.0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dhcp_client_ip: Option<std::net::Ipv4Addr>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process: Option<String>,
 }
@@ -114,6 +120,8 @@ pub fn parse_packet(ethernet: &EthernetPacket) -> Option<CapturedPacket> {
                 domain_hint,
                 tls_fingerprint,
                 dhcp_fingerprint: None,
+                dhcp_hostname: None,
+                dhcp_client_ip: None,
                 process: None,
             })
         }
@@ -129,12 +137,17 @@ pub fn parse_packet(ethernet: &EthernetPacket) -> Option<CapturedPacket> {
                 None
             };
             
-            // DHCP fingerprinting ingestion
-            let dhcp_fingerprint = if (src_port == 68 && dst_port == 67) || (src_port == 67 && dst_port == 68) {
-                parse_dhcp_fingerprint(udp.payload())
-            } else {
-                None
-            };
+            // DHCP fingerprinting + hostname ingestion
+            let (dhcp_fingerprint, dhcp_hostname, dhcp_client_ip) =
+                if src_port == 68 && dst_port == 67 {
+                    let fp = parse_dhcp_fingerprint(udp.payload());
+                    let (hn, cip) = parse_dhcp_hostname(udp.payload());
+                    (fp, hn, cip)
+                } else if src_port == 67 && dst_port == 68 {
+                    (parse_dhcp_fingerprint(udp.payload()), None, None)
+                } else {
+                    (None, None, None)
+                };
 
             Some(CapturedPacket {
                 timestamp: Local::now(),
@@ -152,6 +165,8 @@ pub fn parse_packet(ethernet: &EthernetPacket) -> Option<CapturedPacket> {
                 domain_hint: None,
                 tls_fingerprint: None,
                 dhcp_fingerprint,
+                dhcp_hostname,
+                dhcp_client_ip,
                 process: None,
             })
         }
@@ -177,6 +192,8 @@ pub fn parse_packet(ethernet: &EthernetPacket) -> Option<CapturedPacket> {
                 domain_hint: None,
                 tls_fingerprint: None,
                 dhcp_fingerprint: None,
+                dhcp_hostname: None,
+                dhcp_client_ip: None,
                 process: None,
             })
         }
@@ -601,6 +618,65 @@ fn parse_dhcp_fingerprint(data: &[u8]) -> Option<String> {
         pos = data_start + opt_len;
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// DHCP Option 12 hostname + client IP extraction
+// ---------------------------------------------------------------------------
+
+/// Parse a DHCP DISCOVER/REQUEST and extract:
+/// - Option 12 (Hostname) → the human-readable device name the client announces
+/// - ciaddr (bytes 12-15) or Option 50 (Requested IP) → the device's real IP
+///   (needed because src_ip is 0.0.0.0 during initial DHCP negotiation)
+pub fn parse_dhcp_hostname(data: &[u8]) -> (Option<String>, Option<std::net::Ipv4Addr>) {
+    if data.len() < 240 { return (None, None); }
+    if data[0] != 1 { return (None, None); } // BOOTREQUEST only
+
+    if data[236] != 99 || data[237] != 130 || data[238] != 83 || data[239] != 99 {
+        return (None, None);
+    }
+
+    // ciaddr is at bytes 12-15; non-zero when the client already has a lease
+    let ciaddr = std::net::Ipv4Addr::new(data[12], data[13], data[14], data[15]);
+    let mut client_ip: Option<std::net::Ipv4Addr> =
+        if ciaddr != std::net::Ipv4Addr::UNSPECIFIED { Some(ciaddr) } else { None };
+
+    let mut hostname: Option<String> = None;
+
+    let mut pos = 240;
+    while pos < data.len() {
+        let opt_code = data[pos];
+        if opt_code == 255 { break; }
+        if opt_code == 0 { pos += 1; continue; }
+
+        if pos + 1 >= data.len() { break; }
+        let opt_len = data[pos + 1] as usize;
+        let data_start = pos + 2;
+        if data_start + opt_len > data.len() { break; }
+
+        match opt_code {
+            12 if opt_len > 0 => {
+                if let Ok(s) = std::str::from_utf8(&data[data_start..data_start + opt_len]) {
+                    let s = s.trim().to_string();
+                    if !s.is_empty() {
+                        hostname = Some(s);
+                    }
+                }
+            }
+            50 if opt_len == 4 && client_ip.is_none() => {
+                // Requested IP Address — fallback when ciaddr is 0.0.0.0
+                client_ip = Some(std::net::Ipv4Addr::new(
+                    data[data_start], data[data_start+1],
+                    data[data_start+2], data[data_start+3],
+                ));
+            }
+            _ => {}
+        }
+
+        pos = data_start + opt_len;
+    }
+
+    (hostname, client_ip)
 }
 
 // ---------------------------------------------------------------------------

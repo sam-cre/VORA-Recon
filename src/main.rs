@@ -42,7 +42,6 @@ struct Args {
 
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("DEBUG: Sonos RINCON Regex Pattern: ^[\\d\\.]+\\s+-\\s+(.+?)\\s+-\\s+RINCON_[0-9A-Fa-f]+$");
     let args = Args::parse();
     
     let (iface_name, resolved_iface_name) = match args.interface.clone() {
@@ -135,13 +134,21 @@ fn run_app(
     let current_network = {
         #[cfg(windows)]
         {
+            // Get-NetConnectionProfile can return multiple profiles (WiFi + Ethernet + virtual
+            // adapters) on separate lines. We want the first real WiFi/LAN profile name —
+            // skip Windows placeholder strings that vary run-to-run.
+            let junk = ["identifying", "unidentified", "network", ""];
             std::process::Command::new("powershell")
                 .args(["-NoProfile", "-Command", "(Get-NetConnectionProfile).Name"])
                 .output()
                 .ok()
                 .and_then(|out| {
-                    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if stdout.is_empty() { None } else { Some(stdout) }
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    stdout.lines()
+                        .map(|l| l.trim().to_string())
+                        .find(|l| {
+                            !l.is_empty() && !junk.iter().any(|j| l.to_ascii_lowercase() == *j)
+                        })
                 })
                 .unwrap_or_else(|| interface_name_label.clone())
         }
@@ -157,6 +164,10 @@ fn run_app(
     {
         let baseline = discovery::load_baseline(&current_network);
         if !baseline.is_empty() {
+            // Capture baseline IPs before moving the map — used by [NEW] marker
+            for ip in baseline.keys() {
+                state.baseline_ips.insert(*ip);
+            }
             if let Ok(mut active) = state.active_discovery.lock() {
                 *active = baseline;
             }
@@ -221,6 +232,10 @@ fn run_app(
 
         // Drain Discovery status updates
         while let Ok(status) = disco_status_rx.try_recv() {
+            // "Ready (N discovered)" signals the scan finished — gate [NEW] display
+            if status.starts_with("Ready (") {
+                state.fresh_scan_done = true;
+            }
             state.discovery_status = status;
             state.last_discovery_time = chrono::Local::now().format("%H:%M:%S").to_string();
         }
@@ -252,14 +267,20 @@ fn run_app(
 
         // Drain Discovery alerts
         while let Ok(alert_msg) = disco_alert_rx.try_recv() {
+            let is_sonos_note = alert_msg.contains("Sonos group MAC shared across") && alert_msg.contains("expected behavior");
+            let (level, tier, reason) = if is_sonos_note {
+                (display::AlertLevel::Info, display::AlertTier::Noise, display::AlertReason::LocalBroadcast)
+            } else {
+                (display::AlertLevel::Warn, display::AlertTier::Suspicious, display::AlertReason::SuspiciousFlags)
+            };
             state.push_alert(display::Alert {
                 timestamp: chrono::Local::now(),
                 message: alert_msg,
-                level: display::AlertLevel::Warn,
-                tier: display::AlertTier::Suspicious,
+                level,
+                tier,
                 remote_ip: None,
                 process: None,
-                reason: display::AlertReason::SuspiciousFlags,
+                reason,
             });
         }
 
@@ -320,6 +341,41 @@ fn run_app(
                                     .unwrap_or(0);
                                 if existing_conf < 200 {
                                     state.os_fingerprints.insert(pkt.src_ip, (tag, 200));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // DHCP Option 12 hostname ingestion
+                if let Some(ref dhcp_name) = pkt.dhcp_hostname {
+                    // Resolve the real device IP: prefer Option 50 / ciaddr from DHCP,
+                    // fall back to src_ip (works for DHCP Request where src != 0.0.0.0)
+                    let device_ip: Option<std::net::IpAddr> = pkt.dhcp_client_ip
+                        .map(std::net::IpAddr::V4)
+                        .or_else(|| {
+                            if let std::net::IpAddr::V4(v4) = pkt.src_ip {
+                                if v4.octets() != [0, 0, 0, 0] { Some(pkt.src_ip) } else { None }
+                            } else { None }
+                        });
+
+                    if let Some(ip) = device_ip {
+                        if display::is_local_ip(&ip) {
+                            let cleaned = display::clean_hostname(dhcp_name);
+                            if cleaned != "\u{2014}" {
+                                if let Ok(mut active) = state.active_discovery.lock() {
+                                    if let Some(dev) = active.get_mut(&ip) {
+                                        if dev.hostname == "\u{2014}" || dev.hostname == "Resolving..." {
+                                            dev.hostname = cleaned.clone();
+                                        }
+                                    }
+                                }
+                                if let Ok(mut passive) = state.passive_discovery.lock() {
+                                    if let Some(dev) = passive.get_mut(&ip) {
+                                        if dev.hostname == "\u{2014}" || dev.hostname == "Resolving..." {
+                                            dev.hostname = cleaned;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -547,6 +603,18 @@ fn export_report(state: &AppState, path: &str) -> std::io::Result<()> {
     writeln!(file, "Interface:    {}", state.interface_name)?;
     writeln!(file, "Network:      {}", state.current_network)?;
     writeln!(file, "Duration:     {}", duration_fmt)?;
+    {
+        // Show which baseline file was used — helps diagnose [NEW] false-positives
+        let safe = state.current_network.chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect::<String>();
+        let baseline_note = if state.baseline_ips.is_empty() {
+            "(no prior baseline — all devices treated as new)".to_string()
+        } else {
+            format!("({} known IPs from prior session)", state.baseline_ips.len())
+        };
+        writeln!(file, "Baseline:     {}.json  {}", safe, baseline_note)?;
+    }
     writeln!(file, "----------------------------------------------------------------")?;
 
     // --- 1. Security Summary ---
@@ -574,6 +642,26 @@ fn export_report(state: &AppState, path: &str) -> std::io::Result<()> {
         writeln!(file)?;
     }
 
+    // Baseline delta
+    if state.fresh_scan_done {
+        let devices_snap = state.active_discovery.lock().unwrap();
+        let new_devices: Vec<_> = devices_snap.iter()
+            .filter(|(ip, _)| state.baseline_ips.is_empty() || !state.baseline_ips.contains(*ip))
+            .collect();
+        if !new_devices.is_empty() {
+            writeln!(file, "\n[ BASELINE DELTA — NEW DEVICES THIS SESSION ]")?;
+            let mut new_sorted: Vec<_> = new_devices.iter().collect();
+            new_sorted.sort_by_key(|(ip, _)| *ip);
+            for (ip, dev) in new_sorted {
+                let host = display::clean_hostname(&dev.hostname);
+                writeln!(file, "  {:<16}  {}  ({})", ip, host, dev.vendor)?;
+            }
+        } else {
+            writeln!(file, "\n[ BASELINE DELTA ] No new devices detected this session.")?;
+        }
+        drop(devices_snap);
+    }
+
     // --- 2. Traffic Summary ---
     writeln!(file, "\n[ TRAFFIC STATISTICS ]")?;
     writeln!(file, "Total Packets:     {}", state.total_packets)?;
@@ -593,24 +681,27 @@ fn export_report(state: &AppState, path: &str) -> std::io::Result<()> {
     let devices = state.active_discovery.lock().unwrap();
     if !devices.is_empty() {
         writeln!(file, "\n[ LOCAL NETWORK INVENTORY ]")?;
-        writeln!(file, "{:<16} | {:<30} | {:<25} | {:<18} | {:<8}", "IP Address", "Hostname", "OUI Vendor", "MAC Address", "OS")?;
-        writeln!(file, "-----------------|--------------------------------|---------------------------|--------------------|---------")?;
+        writeln!(file, "{:<16} | {:<11} | {:<30} | {:<25} | {:<18} | {:<8}", "IP Address", "Category", "Hostname", "OUI Vendor", "MAC Address", "OS")?;
+        writeln!(file, "-----------------|-------------|--------------------------------|---------------------------|--------------------|---------")?;
         let mut dev_vec: Vec<_> = devices.iter().collect();
         dev_vec.sort_by_key(|(ip, _)| *ip);
         let meta_guard = state.device_metadata.lock().ok();
         for (ip, dev) in &dev_vec {
             let os_tag = state.get_resolved_os_tag(ip);
-            
-            // Priority chain for report hostname:
-            // 1. Cleaned discovery hostname
-            // 2. Metadata model/friendly_name (using already-locked meta_guard)
-            // 3. —
+            let is_new = state.baseline_ips.is_empty() || !state.baseline_ips.contains(*ip);
+            let new_marker = if state.fresh_scan_done && is_new { " [NEW]" } else { "" };
+
+            let category = meta_guard.as_ref()
+                .and_then(|m| m.get(ip))
+                .and_then(|m| m.get("category"))
+                .cloned()
+                .unwrap_or_else(|| "—".to_string());
+
             let display_host = {
                 let from_discovery = display::clean_hostname(&dev.hostname);
                 if from_discovery != "\u{2014}" && from_discovery != "Resolving..." && !from_discovery.is_empty() {
                     from_discovery
                 } else if let Some(ref meta) = meta_guard {
-                    // meta_guard is already locked — no try_lock needed
                     meta.get(ip)
                         .and_then(|m| {
                             m.get("model")
@@ -624,14 +715,42 @@ fn export_report(state: &AppState, path: &str) -> std::io::Result<()> {
                     "\u{2014}".to_string()
                 }
             };
-            
-            writeln!(file, "{:<16} | {:<30} | {:<25} | {:<18} | {:<8}", 
-                ip.to_string(), 
-                display_host,
-                dev.vendor, 
-                dev.mac, 
+
+            let host_with_marker = format!("{}{}", display_host, new_marker);
+            writeln!(file, "{:<16} | {:<11} | {:<30} | {:<25} | {:<18} | {:<8}",
+                ip.to_string(),
+                category,
+                host_with_marker,
+                display::strip_control_chars(&dev.vendor),
+                dev.mac,
                 os_tag
             )?;
+        }
+
+        // Subnet Summary section
+        {
+            let mut subnet_map: std::collections::BTreeMap<String, Vec<_>> = std::collections::BTreeMap::new();
+            for (ip, dev) in &dev_vec {
+                if let std::net::IpAddr::V4(v4) = ip {
+                    let o = v4.octets();
+                    let subnet = format!("{}.{}.{}.0/24", o[0], o[1], o[2]);
+                    subnet_map.entry(subnet).or_default().push((*ip, dev));
+                }
+            }
+            if subnet_map.len() > 1 {
+                writeln!(file, "\n[ SUBNET SUMMARY ]")?;
+                for (subnet, members) in &subnet_map {
+                    writeln!(file, "\n  {} ({} device{})", subnet, members.len(), if members.len() == 1 { "" } else { "s" })?;
+                    for (ip, dev) in members {
+                        let cat = meta_guard.as_ref()
+                            .and_then(|m| m.get(ip))
+                            .and_then(|m| m.get("category"))
+                            .cloned()
+                            .unwrap_or_else(|| "?".to_string());
+                        writeln!(file, "    {:<16} [{:<9}] {}", ip, cat, display::strip_control_chars(&dev.hostname))?;
+                    }
+                }
+            }
         }
 
         // Device Metadata section (mDNS TXT + SSDP/UPnP enrichment)
@@ -644,20 +763,26 @@ fn export_report(state: &AppState, path: &str) -> std::io::Result<()> {
                 writeln!(file, "{:<16} | {:<28} | {:<20} | {:<20} | {}", "IP Address", "Model", "Firmware", "Services", "Extra")?;
                 writeln!(file, "-----------------|------------------------------|----------------------|----------------------|------")?;
                 for (ip, dev_meta) in enriched {
-                    let model = dev_meta.get("model")
+                    let sc = |s: String| display::strip_control_chars(&s);
+                    let model = sc(dev_meta.get("model")
                         .or_else(|| dev_meta.get("friendly_name"))
                         .or_else(|| dev_meta.get("model_name"))
-                        .cloned().unwrap_or_else(|| "—".to_string());
-                    let firmware = dev_meta.get("firmware")
+                        .cloned().unwrap_or_else(|| "—".to_string()));
+                    let firmware = sc(dev_meta.get("firmware")
                         .or_else(|| dev_meta.get("os_version"))
-                        .cloned().unwrap_or_else(|| "—".to_string());
-                    let services = dev_meta.get("services")
-                        .cloned().unwrap_or_else(|| "—".to_string());
-                    let extra = dev_meta.get("manufacturer")
+                        .cloned().unwrap_or_else(|| "—".to_string()));
+                    let services = if dev_meta.services.is_empty() {
+                        "—".to_string()
+                    } else {
+                        let mut svcs_vec: Vec<_> = dev_meta.services.iter().cloned().collect();
+                        svcs_vec.sort();
+                        sc(svcs_vec.join(", "))
+                    };
+                    let extra = sc(dev_meta.get("manufacturer")
                         .or_else(|| dev_meta.get("serial"))
                         .or_else(|| dev_meta.get("homekit_category"))
-                        .cloned().unwrap_or_else(|| "—".to_string());
-                    writeln!(file, "{:<16} | {:<28} | {:<20} | {:<20} | {}", 
+                        .cloned().unwrap_or_else(|| "—".to_string()));
+                    writeln!(file, "{:<16} | {:<28} | {:<20} | {:<20} | {}",
                         ip.to_string(), model, firmware, services, extra)?;
                 }
             }

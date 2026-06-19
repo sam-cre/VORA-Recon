@@ -38,11 +38,23 @@ pub fn start_geo_thread(
                 Ok(response) => {
                     if let Ok(data) = response.into_json::<IpApiResponse>() {
                         if data.status == "success" {
+                            // Strip control chars from API response fields — a MITM on the
+                            // plaintext HTTP connection could inject ANSI sequences otherwise.
+                            let clean = |s: String| s.chars().filter(|c| !c.is_control()).collect::<String>();
+                            let country = data.countryCode.map(clean).unwrap_or_else(|| "??".to_string());
+                            // Validate country code is 2 ASCII letters; reject anything else
+                            let country = if country.len() == 2 && country.chars().all(|c| c.is_ascii_alphabetic()) {
+                                country
+                            } else {
+                                "??".to_string()
+                            };
                             let info = GeoInfo {
-                                country_code: data.countryCode.unwrap_or_else(|| "??".to_string()),
-                                city: data.city,
-                                region: data.region,
-                                org: data.org.unwrap_or_else(|| "Unknown".to_string()),
+                                country_code: country,
+                                city: data.city.map(|s| s.chars().filter(|c| !c.is_control()).collect()),
+                                region: data.region.map(|s| s.chars().filter(|c| !c.is_control()).collect()),
+                                org: data.org.map(|s| s.chars().filter(|c| !c.is_control()).collect::<String>())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or_else(|| "Unknown".to_string()),
                             };
                             let _ = res_tx.send((ip, Some(info)));
                         } else {

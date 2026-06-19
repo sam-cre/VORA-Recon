@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -6,10 +6,26 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 use std::process::Command;
+use dashmap::DashMap;
 
-/// Device metadata collected from mDNS TXT records and SSDP/UPnP XML descriptions.
-/// Keys include: "model", "firmware", "friendly_name", "manufacturer", "serial", "services", etc.
-pub type DeviceMetadata = HashMap<IpAddr, HashMap<String, String>>;
+/// Detailed rich metadata collected from mDNS TXT records and SSDP/UPnP XML descriptions.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct DeviceDetails {
+    pub services: HashSet<String>,
+    pub properties: HashMap<String, String>,
+}
+
+impl DeviceDetails {
+    pub fn get(&self, key: &str) -> Option<&String> {
+        self.properties.get(key)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.services.is_empty() && self.properties.is_empty()
+    }
+}
+
+pub type DeviceMetadata = HashMap<IpAddr, DeviceDetails>;
 
 /// Detailed information about a discovered network device.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -30,16 +46,165 @@ pub fn default_unix_now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+#[cfg(not(windows))]
 use dns_lookup::lookup_addr;
+
+/// Helper to process an mDNS packet, harvesting A records, service instance names, and TXT record metadata.
+#[cfg(windows)]
+fn process_mdns_packet(
+    data: &[u8],
+    src_ip: std::net::Ipv4Addr,
+    hosts: &mut HashMap<IpAddr, String>,
+    metadata: &mut HashMap<IpAddr, DeviceDetails>,
+) {
+    let mut packet_ipv4 = src_ip;
+    let mut a_record_found = false;
+
+    // Harvest any A record names from the response
+    for (name, resolved_ip) in parse_mdns_a_records(data) {
+        let clean = name.trim_end_matches(".local").trim_end_matches('.').to_string();
+        if !clean.is_empty() {
+            if let IpAddr::V4(v4) = resolved_ip {
+                // Only the first A record sets packet_ipv4 — prevents misattribution
+                // when a sleep-proxy packet carries A records for multiple devices.
+                if !a_record_found {
+                    packet_ipv4 = v4;
+                    a_record_found = true;
+                }
+                hosts.entry(IpAddr::V4(v4)).or_insert(clean);
+            }
+        }
+    }
+
+    // Map any service instances found in the packet to the determined IPv4 address
+    for instance_name in parse_mdns_service_instances(data) {
+        let clean = instance_name
+            .trim_end_matches(".local")
+            .trim_end_matches('.')
+            .to_string();
+        let device_name = clean.split("._").next().unwrap_or(&clean);
+        let device_name = device_name.split('@').last().unwrap_or(device_name);
+        // Strip sleep-proxy eero prefix: "70-35-60-63.1 Master Bedroom" -> "Master Bedroom"
+        let device_name = if let Some(space_pos) = device_name.find(' ') {
+            let pre = &device_name[..space_pos];
+            if pre.contains('.') || pre.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+                device_name[space_pos + 1..].trim()
+            } else {
+                device_name.trim()
+            }
+        } else {
+            device_name.trim()
+        }.to_string();
+
+        if !device_name.is_empty() {
+            hosts.entry(IpAddr::V4(packet_ipv4)).or_insert(device_name);
+        }
+    }
+
+    // Parse TXT records for rich device metadata
+    for (record_name, pairs) in parse_mdns_txt_records(data) {
+        let ip_key = IpAddr::V4(packet_ipv4);
+        let meta = metadata.entry(ip_key).or_insert_with(DeviceDetails::default);
+        for (key, value) in &pairs {
+            match key.as_str() {
+                // Apple _companion-link rpMd = device model code
+                "rpmd" => {
+                    meta.properties.insert("model_code".to_string(), value.clone());
+                    if let Some(human) = resolve_apple_model(value) {
+                        meta.properties.insert("model".to_string(), human.to_string());
+                    }
+                }
+                // _device-info model/wmodel field
+                "model" | "wmodel" => {
+                    if !meta.properties.contains_key("model_code") {
+                        meta.properties.insert("model_code".to_string(), value.clone());
+                    }
+                    if !meta.properties.contains_key("model") {
+                        if let Some(human) = resolve_apple_model(value) {
+                            meta.properties.insert("model".to_string(), human.to_string());
+                        }
+                    }
+                }
+                // _raop am = AirPlay device model
+                "am" => {
+                    if !meta.properties.contains_key("model_code") {
+                        meta.properties.insert("model_code".to_string(), value.clone());
+                        if let Some(human) = resolve_apple_model(value) {
+                            meta.properties.insert("model".to_string(), human.to_string());
+                        }
+                    }
+                }
+                // macOS version
+                "osxvers" => {
+                    let os_name = match value.as_str() {
+                        "24" => "macOS 15 Sequoia",
+                        "23" => "macOS 14 Sonoma",
+                        "22" => "macOS 13 Ventura",
+                        "21" => "macOS 12 Monterey",
+                        "20" => "macOS 11 Big Sur",
+                        _ => value.as_str(),
+                    };
+                    meta.properties.insert("os_version".to_string(), os_name.to_string());
+                }
+                // Chromecast / Google device friendly name
+                "fn" => { meta.properties.insert("friendly_name".to_string(), value.clone()); }
+                // Model name
+                "md" => {
+                    if !meta.properties.contains_key("model") {
+                        meta.properties.insert("model".to_string(), value.clone());
+                    }
+                }
+                // AirPlay source version
+                "srcvers" | "vs" => { meta.properties.insert("firmware".to_string(), value.clone()); }
+                // HomeKit category
+                "ci" => {
+                    let category = match value.as_str() {
+                        "1" => "Other",
+                        "2" => "Bridge",
+                        "3" => "Fan",
+                        "4" => "Garage Door",
+                        "5" => "Lightbulb",
+                        "6" => "Door Lock",
+                        "7" => "Outlet",
+                        "8" => "Switch",
+                        "9" => "Thermostat",
+                        "10" => "Sensor",
+                        "11" => "Security System",
+                        "12" => "Door",
+                        "13" => "Window",
+                        "14" => "Window Covering",
+                        "17" => "Sprinkler",
+                        "28" => "TV",
+                        "32" => "Router",
+                        _ => value.as_str(),
+                    };
+                    meta.properties.insert("homekit_category".to_string(), category.to_string());
+                }
+                _ => {}
+            }
+        }
+        // Track which service this came from
+        if record_name.contains("_airplay") { meta.services.insert("AirPlay".to_string()); }
+        if record_name.contains("_raop") { meta.services.insert("AirPlay Audio".to_string()); }
+        if record_name.contains("_hap") { meta.services.insert("HomeKit".to_string()); }
+        if record_name.contains("_googlecast") { meta.services.insert("Chromecast".to_string()); }
+        if record_name.contains("_spotify") { meta.services.insert("Spotify Connect".to_string()); }
+        if record_name.contains("_companion-link") { meta.services.insert("Apple Companion".to_string()); }
+        if record_name.contains("_apple-mobdev2") { meta.services.insert("iPhone/iPad".to_string()); }
+        if record_name.contains("_airdrop") { meta.services.insert("AirDrop".to_string()); }
+        if record_name.contains("_remotepairing") { meta.services.insert("iPhone".to_string()); }
+        if record_name.contains("_continuity") { meta.services.insert("Continuity".to_string()); }
+    }
+}
 
 /// Resolve hostnames via raw mDNS PTR queries (bypasses mdns_sd daemon port conflict)
 /// Sends mDNS reverse lookup queries for each IP and parses responses directly
 #[cfg(windows)]
-fn collect_mdns_hostnames(ips: &[IpAddr], timeout_secs: u64) -> (HashMap<IpAddr, String>, HashMap<IpAddr, HashMap<String, String>>) {
+fn collect_mdns_hostnames(ips: &[IpAddr], timeout_secs: u64) -> (HashMap<IpAddr, String>, HashMap<IpAddr, DeviceDetails>) {
     use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 
     let mut result: HashMap<IpAddr, String> = HashMap::new();
-    let mut txt_metadata: HashMap<IpAddr, HashMap<String, String>> = HashMap::new();
+    let mut txt_metadata: HashMap<IpAddr, DeviceDetails> = HashMap::new();
     if ips.is_empty() { return (result, txt_metadata); }
 
     // Filter to only IPv4 private IPs (mDNS reverse lookup targets)
@@ -55,15 +220,23 @@ fn collect_mdns_hostnames(ips: &[IpAddr], timeout_secs: u64) -> (HashMap<IpAddr,
     };
     let _ = sock.set_reuse_address(true);
     let addr: SocketAddr = "0.0.0.0:5353".parse().unwrap();
-    if sock.bind(&addr.into()).is_err() {
-        return (result, txt_metadata);
+    // Try port 5353 for multicast receive; fall back to ephemeral so QU-bit queries
+    // still get unicast responses when Chrome or Windows mDNS already holds 5353.
+    let bound_multicast = sock.bind(&addr.into()).is_ok();
+    if !bound_multicast {
+        let ephemeral: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        if sock.bind(&ephemeral.into()).is_err() {
+            return (result, txt_metadata);
+        }
     }
     let socket: UdpSocket = sock.into();
 
     let _ = socket.set_read_timeout(Some(Duration::from_millis(800)));
-    // Join the mDNS multicast group to receive responses
+    // Join the mDNS multicast group to receive responses (requires port 5353)
     let mdns_addr: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
-    let _ = socket.join_multicast_v4(&mdns_addr, &Ipv4Addr::UNSPECIFIED);
+    if bound_multicast {
+        let _ = socket.join_multicast_v4(&mdns_addr, &Ipv4Addr::UNSPECIFIED);
+    }
 
     let mdns_target: SocketAddr = SocketAddr::new(IpAddr::V4(mdns_addr), 5353);
 
@@ -113,8 +286,7 @@ fn collect_mdns_hostnames(ips: &[IpAddr], timeout_secs: u64) -> (HashMap<IpAddr,
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    // Build IP-to-MAC lookup from the IPs we know about for matching service responses
-    let mut name_to_ip: HashMap<String, IpAddr> = HashMap::new();
+
 
     // Collect responses for the timeout period
     let start = std::time::Instant::now();
@@ -134,152 +306,8 @@ fn collect_mdns_hostnames(ips: &[IpAddr], timeout_secs: u64) -> (HashMap<IpAddr,
                         result.insert(IpAddr::V4(ip), clean);
                     }
                 }
-                // Determine the IPv4 address for this packet (either from UDP source or from an A record inside)
-                let mut packet_ipv4 = None;
                 if let IpAddr::V4(src_v4) = src_addr.ip() {
-                    packet_ipv4 = Some(src_v4);
-                }
-
-                // Also harvest any A record names from the response
-                for (hostname, resolved_ip) in parse_mdns_a_records(data) {
-                    let clean = hostname
-                        .trim_end_matches(".local")
-                        .trim_end_matches('.')
-                        .to_string();
-                    if !clean.is_empty() {
-                        name_to_ip.insert(clean.clone(), resolved_ip);
-                        if let IpAddr::V4(v4) = resolved_ip {
-                            // If this IP is in our target list, map it
-                            if v4_ips.contains(&v4) {
-                                result.entry(resolved_ip).or_insert(clean);
-                            }
-                            packet_ipv4 = Some(v4); // Use this IP for the rest of the packet
-                        }
-                    }
-                }
-
-                // Map any service instances found in the packet to the determined IPv4 address
-                if let Some(src_v4) = packet_ipv4 {
-                    if v4_ips.contains(&src_v4) {
-                        for instance_name in parse_mdns_service_instances(data) {
-                            let clean = instance_name
-                                .trim_end_matches(".local")
-                                .trim_end_matches('.')
-                                .to_string();
-                            let device_name = clean.split("._").next().unwrap_or(&clean);
-                            let device_name = device_name.split('@').last().unwrap_or(device_name);
-                            // Strip sleep-proxy eero prefix: "70-35-60-63.1 Master Bedroom" -> "Master Bedroom"
-                            let device_name = if let Some(space_pos) = device_name.find(' ') {
-                                let pre = &device_name[..space_pos];
-                                if pre.contains('.') || pre.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
-                                    device_name[space_pos + 1..].trim()
-                                } else {
-                                    device_name.trim()
-                                }
-                            } else {
-                                device_name.trim()
-                            }.to_string();
-
-                            if !device_name.is_empty() {
-                                result.insert(IpAddr::V4(src_v4), device_name);
-                            }
-                        }
-                    }
-
-                    // Parse TXT records for rich device metadata
-                    for (record_name, pairs) in parse_mdns_txt_records(data) {
-                        let ip_key = IpAddr::V4(src_v4);
-                        let meta = txt_metadata.entry(ip_key).or_insert_with(HashMap::new);
-                        for (key, value) in &pairs {
-                            match key.as_str() {
-                                // Apple _companion-link rpMd = device model code
-                                "rpmd" => {
-                                    meta.insert("model_code".to_string(), value.clone());
-                                    if let Some(human) = resolve_apple_model(value) {
-                                        meta.insert("model".to_string(), human.to_string());
-                                    }
-                                }
-                                // _device-info model field
-                                "model" | "wmodel" => {
-                                    if !meta.contains_key("model_code") {
-                                        meta.insert("model_code".to_string(), value.clone());
-                                    }
-                                    if !meta.contains_key("model") {
-                                        if let Some(human) = resolve_apple_model(value) {
-                                            meta.insert("model".to_string(), human.to_string());
-                                        }
-                                    }
-                                }
-                                // _raop am = AirPlay device model
-                                "am" => {
-                                    if !meta.contains_key("model_code") {
-                                        meta.insert("model_code".to_string(), value.clone());
-                                        if let Some(human) = resolve_apple_model(value) {
-                                            meta.insert("model".to_string(), human.to_string());
-                                        }
-                                    }
-                                }
-                                // macOS version
-                                "osxvers" => {
-                                    let os_name = match value.as_str() {
-                                        "24" => "macOS 15 Sequoia",
-                                        "23" => "macOS 14 Sonoma",
-                                        "22" => "macOS 13 Ventura",
-                                        "21" => "macOS 12 Monterey",
-                                        "20" => "macOS 11 Big Sur",
-                                        _ => value.as_str(),
-                                    };
-                                    meta.insert("os_version".to_string(), os_name.to_string());
-                                }
-                                // Chromecast / Google device
-                                "fn" => { meta.insert("friendly_name".to_string(), value.clone()); }
-                                "md" => {
-                                    if !meta.contains_key("model") {
-                                        meta.insert("model".to_string(), value.clone());
-                                    }
-                                }
-                                // AirPlay source version
-                                "srcvers" | "vs" => { meta.insert("firmware".to_string(), value.clone()); }
-                                // HomeKit category
-                                "ci" => {
-                                    let category = match value.as_str() {
-                                        "1" => "Other",
-                                        "2" => "Bridge",
-                                        "3" => "Fan",
-                                        "4" => "Garage Door",
-                                        "5" => "Lightbulb",
-                                        "6" => "Door Lock",
-                                        "7" => "Outlet",
-                                        "8" => "Switch",
-                                        "9" => "Thermostat",
-                                        "10" => "Sensor",
-                                        "11" => "Security System",
-                                        "12" => "Door",
-                                        "13" => "Window",
-                                        "14" => "Window Covering",
-                                        "17" => "Sprinkler",
-                                        "28" => "TV",
-                                        "32" => "Router",
-                                        _ => value.as_str(),
-                                    };
-                                    meta.insert("homekit_category".to_string(), category.to_string());
-                                }
-                                // Service name used in the record
-                                _ => {}
-                            }
-                        }
-                        // Track which service this came from
-                        if record_name.contains("_airplay") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "AirPlay"); }
-                        if record_name.contains("_raop") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "AirPlay Audio"); }
-                        if record_name.contains("_hap") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "HomeKit"); }
-                        if record_name.contains("_googlecast") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "Chromecast"); }
-                        if record_name.contains("_spotify") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "Spotify Connect"); }
-                        if record_name.contains("_companion-link") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "Apple Companion"); }
-                        if record_name.contains("_apple-mobdev2") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "iPhone/iPad"); }
-                        if record_name.contains("_airdrop") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "AirDrop"); }
-                        if record_name.contains("_remotepairing") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "iPhone"); }
-                        if record_name.contains("_continuity") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "Continuity"); }
-                    }
+                    process_mdns_packet(data, src_v4, &mut result, &mut txt_metadata);
                 }
             }
             Err(_) => {
@@ -297,13 +325,8 @@ fn collect_mdns_hostnames(ips: &[IpAddr], timeout_secs: u64) -> (HashMap<IpAddr,
         }
     }
 
-    let _ = socket.leave_multicast_v4(&mdns_addr, &Ipv4Addr::UNSPECIFIED);
-
-    // Clean up trailing commas from service lists
-    for meta in txt_metadata.values_mut() {
-        if let Some(svc) = meta.get_mut("services") {
-            *svc = svc.trim_end_matches(", ").to_string();
-        }
+    if bound_multicast {
+        let _ = socket.leave_multicast_v4(&mdns_addr, &Ipv4Addr::UNSPECIFIED);
     }
 
     (result, txt_metadata)
@@ -609,10 +632,20 @@ pub fn resolve_apple_model(code: &str) -> Option<&'static str> {
         "Mac14,7" => Some("MacBook Pro 13\" (M2)"),
         "Mac14,5" | "Mac14,9" => Some("MacBook Pro 14\" (M2 Pro)"),
         "Mac14,6" | "Mac14,10" => Some("MacBook Pro 16\" (M2 Max)"),
-        "Mac15,3" => Some("MacBook Air 15\" (M3)"),
-        "Mac15,12" | "Mac15,13" => Some("MacBook Air 13\" (M3)"),
+        // M3 Laptops
+        "Mac15,3" => Some("MacBook Pro 14\" (M3)"),
+        "Mac15,12" => Some("MacBook Air 13\" (M3)"),
+        "Mac15,13" => Some("MacBook Air 15\" (M3)"),
         "Mac15,6" | "Mac15,8" | "Mac15,10" => Some("MacBook Pro 14\" (M3 Pro)"),
         "Mac15,7" | "Mac15,9" | "Mac15,11" => Some("MacBook Pro 16\" (M3 Max)"),
+        // M4 Laptops
+        "Mac16,1" => Some("MacBook Pro 14\" (M4)"),
+        "Mac16,5" => Some("MacBook Pro 16\" (M4 Max)"),
+        "Mac16,6" => Some("MacBook Pro 14\" (M4 Max)"),
+        "Mac16,7" => Some("MacBook Pro 16\" (M4 Pro)"),
+        "Mac16,8" => Some("MacBook Pro 14\" (M4 Pro)"),
+        "Mac16,12" => Some("MacBook Air 13\" (M4)"),
+        "Mac16,13" => Some("MacBook Air 15\" (M4)"),
 
         // === iMac / Mac Desktop ===
         "iMac21,1" | "iMac21,2" => Some("iMac 24\" (M1)"),
@@ -621,6 +654,14 @@ pub fn resolve_apple_model(code: &str) -> Option<&'static str> {
         "Mac13,2" => Some("Mac Studio (M1 Ultra)"),
         "Mac14,13" | "Mac14,14" => Some("Mac Studio (M2)"),
         "Mac14,8" => Some("Mac Pro (2023)"),
+        // M3 Desktops
+        "Mac15,4" | "Mac15,5" => Some("iMac 24\" (M3)"),
+        "Mac15,14" => Some("Mac Studio (M3)"),
+        // M4 Desktops
+        "Mac16,2" | "Mac16,3" => Some("iMac 24\" (M4)"),
+        "Mac16,9" => Some("Mac Studio (M4 Max)"),
+        "Mac16,10" => Some("Mac mini (M4)"),
+        "Mac16,11" => Some("Mac mini (M4 Pro)"),
 
         // === Apple TV ===
         "AppleTV6,2" => Some("Apple TV 4K (1st gen)"),
@@ -651,6 +692,7 @@ pub fn resolve_apple_model(code: &str) -> Option<&'static str> {
             if code.starts_with("iPhone") { Some("iPhone (unknown model)") }
             else if code.starts_with("iPad") { Some("iPad (unknown model)") }
             else if code.starts_with("MacBook") { Some("MacBook (unknown model)") }
+            else if code.starts_with("Mac16,") { Some("Mac (unknown model)") }
             else if code.starts_with("Mac") { Some("Mac (unknown model)") }
             else if code.starts_with("AppleTV") { Some("Apple TV (unknown model)") }
             else if code.starts_with("AudioAccessory") { Some("HomePod (unknown model)") }
@@ -671,6 +713,23 @@ fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
     let end = xml[start..].find(&close)? + start;
     let value = xml[start..end].trim().to_string();
     if value.is_empty() { None } else { Some(value) }
+}
+
+/// Validate that a SSDP LOCATION URL points to a local IP to prevent SSRF.
+/// Rejects hostnames (DNS rebinding) and any non-local IP address.
+fn is_local_ssdp_url(url: &str) -> bool {
+    let host = url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .and_then(|h| h.split(':').next())
+        .unwrap_or("");
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        crate::display::is_local_ip(&ip)
+    } else {
+        false
+    }
 }
 
 /// Discover UPnP/SSDP devices on the local network via M-SEARCH multicast.
@@ -729,14 +788,20 @@ fn ssdp_discover(timeout_secs: u64) -> HashMap<IpAddr, HashMap<String, String>> 
                         let lower = line.to_lowercase();
                         if lower.starts_with("location:") {
                             let url = line[9..].trim().to_string();
-                            if url.starts_with("http") {
+                            if url.starts_with("http") && is_local_ssdp_url(&url) {
                                 locations.entry(src_addr.ip()).or_insert(url);
                             }
                         }
                     }
                 }
             }
-            Err(_) => break,
+            Err(_) => {
+                if start.elapsed() < timeout {
+                    continue;
+                } else {
+                    break;
+                }
+            }
         }
     }
 
@@ -824,9 +889,20 @@ fn wsd_discover(timeout_secs: u64) -> HashMap<IpAddr, HashMap<String, String>> {
     let wsd_addr: SocketAddr = "239.255.255.250:3702".parse().unwrap();
 
     // WS-Discovery Probe message
-    let msg_id = format!("urn:uuid:{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as u32,
-        std::process::id() as u16, 0x4000u16, 0x8000u16, std::process::id() as u64);
+    // Build a UUID that won't repeat within the same second: mix nanosecond time
+    // with pid using a multiplicative hash so sequential scans get distinct IDs.
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let pid = std::process::id() as u64;
+    let mix = now_ns.wrapping_mul(6364136223846793005u64).wrapping_add(pid);
+    let msg_id = format!("urn:uuid:{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        (mix >> 32) as u32,
+        (mix >> 16) as u16,
+        mix as u16 & 0x0FFF,
+        0x8000u16 | ((mix >> 48) as u16 & 0x3FFF),
+        now_ns & 0x0000_FFFF_FFFF_FFFF);
 
     let probe = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -899,7 +975,13 @@ fn wsd_discover(timeout_secs: u64) -> HashMap<IpAddr, HashMap<String, String>> {
                     }
                 }
             }
-            Err(_) => break,
+            Err(_) => {
+                if start.elapsed() < timeout {
+                    continue;
+                } else {
+                    break;
+                }
+            }
         }
     }
 
@@ -967,30 +1049,20 @@ fn parse_mdns_ptr_responses(data: &[u8]) -> Vec<(std::net::Ipv4Addr, String)> {
 
 /// Skip a DNS name in a packet, returning the offset after it
 fn skip_dns_name(data: &[u8], mut offset: usize) -> Option<usize> {
+    let mut visited = std::collections::HashSet::new();
     loop {
         if offset >= data.len() { return None; }
         let len = data[offset] as usize;
         if len == 0 { return Some(offset + 1); }
-        if len >= 0xC0 { return Some(offset + 2); } // Compression pointer
-        offset += 1 + len;
-    }
-}
-
-/// Read a DNS name from a packet, handling compression pointers
-fn add_service(existing_services: &mut String, new_service: &str) {
-    let new_service = new_service.trim();
-    if new_service.is_empty() { return; }
-    
-    let already_present = existing_services
-        .split(',')
-        .map(|s| s.trim())
-        .any(|s| s.eq_ignore_ascii_case(new_service));
-    
-    if !already_present {
-        if !existing_services.is_empty() {
-            existing_services.push_str(", ");
+        if len >= 0xC0 {
+            // Compression pointer
+            if offset + 1 >= data.len() { return None; }
+            if !visited.insert(offset) { return None; }
+            return Some(offset + 2);
         }
-        existing_services.push_str(new_service);
+        // Normal label bounds check
+        if offset + 1 + len > data.len() { return None; }
+        offset += 1 + len;
     }
 }
 
@@ -998,6 +1070,7 @@ fn read_dns_name(data: &[u8], mut offset: usize) -> Option<(String, usize)> {
     let mut parts: Vec<String> = Vec::new();
     let mut end_offset = None;
     let mut jumps = 0;
+    let mut visited = std::collections::HashSet::new();
 
     loop {
         if offset >= data.len() || jumps > 10 { return None; }
@@ -1011,6 +1084,7 @@ fn read_dns_name(data: &[u8], mut offset: usize) -> Option<(String, usize)> {
         if len >= 0xC0 {
             // Compression pointer
             if offset + 1 >= data.len() { return None; }
+            if !visited.insert(offset) { return None; }
             if end_offset.is_none() { end_offset = Some(offset + 2); }
             let ptr = ((len & 0x3F) << 8) | (data[offset + 1] as usize);
             offset = ptr;
@@ -1018,8 +1092,9 @@ fn read_dns_name(data: &[u8], mut offset: usize) -> Option<(String, usize)> {
             continue;
         }
 
+        // Normal label bounds check before label read
+        if offset + 1 + len > data.len() { return None; }
         offset += 1;
-        if offset + len > data.len() { return None; }
         parts.push(String::from_utf8_lossy(&data[offset..offset + len]).to_string());
         offset += len;
     }
@@ -1060,31 +1135,51 @@ fn resolve_netbios_name(ip: &IpAddr) -> Option<String> {
     None
 }
 
-/// Try to resolve hostname via PowerShell Resolve-DnsName (catches devices registered with router DNS)
+/// Batch-resolve hostnames for multiple IPs in a single PowerShell process.
+/// Replaces per-IP spawning which created one powershell.exe per device.
 #[cfg(windows)]
-fn resolve_powershell_dns(ip: &IpAddr) -> Option<String> {
-    let ip_str = ip.to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
+fn resolve_powershell_dns_batch(ips: &[IpAddr]) -> HashMap<IpAddr, String> {
+    let mut results = HashMap::new();
+    if ips.is_empty() { return results; }
 
-    let ip_str_clone = ip_str.clone();
+    let ip_list = ips.iter()
+        .map(|ip| format!("'{}'", ip))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "foreach ($ip in @({})) {{ try {{ $h = (Resolve-DnsName -Name $ip -DnsOnly -EA Stop).NameHost | Select-Object -First 1; if ($h) {{ \"$ip=$h\" }} }} catch {{}} }}",
+        ip_list
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = Command::new("powershell")
-            .args(["-NoProfile", "-Command",
-                &format!("try {{ (Resolve-DnsName -Name '{}' -DnsOnly -ErrorAction Stop).NameHost }} catch {{}}", ip_str_clone)])
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .output();
-        let _ = tx.send(result);
+        let _ = tx.send(out);
     });
 
-    let output = rx.recv_timeout(Duration::from_secs(5)).ok()?.ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() || stdout == ip_str || stdout.contains("Error") {
-        return None;
+    let timeout = Duration::from_secs((ips.len() as u64 / 5).max(10) + 10);
+    if let Ok(Ok(output)) = rx.recv_timeout(timeout) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let line = line.trim();
+            if let Some(eq) = line.find('=') {
+                let ip_str = &line[..eq];
+                let hostname = line[eq + 1..].trim();
+                if hostname.is_empty() || hostname.contains("Error") { continue; }
+                if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                    let clean = hostname.split('.').next().unwrap_or(hostname).to_string();
+                    if !clean.is_empty() && clean != ip_str {
+                        results.insert(ip, clean);
+                    }
+                }
+            }
+        }
     }
-    // Clean up the hostname — strip domain suffix if present
-    let clean = stdout.split('.').next().unwrap_or(&stdout).to_string();
-    if clean.is_empty() || clean == ip_str { None } else { Some(clean) }
+    results
 }
 
 
@@ -1188,14 +1283,130 @@ pub fn start_discovery_thread(
     network_name: String,
 ) {
     thread::spawn(move || {
+        let mut last_cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>> = None;
+        let mut pending_scan = false;
         loop {
-            // WAIT indefinitely for manual signal (Auto-refresh removed for safety)
-            match signal_rx.recv() {
-                Ok(DiscoverySignal::ScanNow) => {
-                    #[cfg(windows)]
-                    perform_scan(&passive_discovery, &active_discovery, &device_metadata, &interface_name, &network_name, &status_tx, &alert_tx);
+            // WAIT indefinitely for manual signal or run a pending scan
+            let run_scan = if pending_scan {
+                pending_scan = false;
+                true
+            } else {
+                match signal_rx.recv() {
+                    Ok(DiscoverySignal::ScanNow) => true,
+                    Err(mpsc::RecvError) => break,
                 }
-                Err(mpsc::RecvError) => break,
+            };
+
+            if run_scan {
+                // Set the previous flag to true (cancelling any running background thread)
+                if let Some(prev) = last_cancel_flag.take() {
+                    prev.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                
+                // Create a new cancellation flag
+                let current_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                last_cancel_flag = Some(Arc::clone(&current_cancel));
+
+                // Create Arc<DashMap> for passive, active, metadata
+                let passive_dash = Arc::new(DashMap::new());
+                {
+                    if let Ok(g) = passive_discovery.lock() {
+                        for (k, v) in g.iter() {
+                            passive_dash.insert(*k, v.clone());
+                        }
+                    }
+                }
+                let active_dash = Arc::new(DashMap::new());
+                {
+                    if let Ok(g) = active_discovery.lock() {
+                        for (k, v) in g.iter() {
+                            active_dash.insert(*k, v.clone());
+                        }
+                    }
+                }
+                let metadata_dash = Arc::new(DashMap::new());
+                {
+                    if let Ok(g) = device_metadata.lock() {
+                        for (k, v) in g.iter() {
+                            metadata_dash.insert(*k, v.clone());
+                        }
+                    }
+                }
+
+                // Spawn a background thread that periodically syncs changes from the DashMaps back to the Arc<Mutex<HashMap>>
+                let active_clone = Arc::clone(&active_discovery);
+                let metadata_clone = Arc::clone(&device_metadata);
+                let active_dash_clone = Arc::clone(&active_dash);
+                let metadata_dash_clone = Arc::clone(&metadata_dash);
+                
+                let sync_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let sync_stop_clone = Arc::clone(&sync_stop);
+                
+                let sync_handle = thread::spawn(move || {
+                    while !sync_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                        // Sync active
+                        if let Ok(mut g) = active_clone.lock() {
+                            for r in active_dash_clone.iter() {
+                                let (k, v) = r.pair();
+                                g.insert(*k, v.clone());
+                            }
+                            g.retain(|k, _| active_dash_clone.contains_key(k));
+                        }
+                        // Sync metadata
+                        if let Ok(mut g) = metadata_clone.lock() {
+                            for r in metadata_dash_clone.iter() {
+                                let (k, v) = r.pair();
+                                g.insert(*k, v.clone());
+                            }
+                            g.retain(|k, _| metadata_dash_clone.contains_key(k));
+                        }
+                        thread::sleep(Duration::from_millis(200));
+                    }
+                    
+                    // Perform one final sync upon stopping to ensure all final state is saved
+                    if let Ok(mut g) = active_clone.lock() {
+                        for r in active_dash_clone.iter() {
+                            let (k, v) = r.pair();
+                            g.insert(*k, v.clone());
+                        }
+                        g.retain(|k, _| active_dash_clone.contains_key(k));
+                    }
+                    if let Ok(mut g) = metadata_clone.lock() {
+                        for r in metadata_dash_clone.iter() {
+                            let (k, v) = r.pair();
+                            g.insert(*k, v.clone());
+                        }
+                        g.retain(|k, _| metadata_dash_clone.contains_key(k));
+                    }
+                });
+
+                // Perform scan using the DashMaps
+                let bg_handle = perform_scan(&passive_dash, &active_dash, &metadata_dash, &interface_name, &network_name, &status_tx, &alert_tx, Arc::clone(&current_cancel));
+
+                // Polling loop to wait for bg_handle to complete or handle new incoming ScanNow signals
+                while !bg_handle.is_finished() {
+                    match signal_rx.try_recv() {
+                        Ok(DiscoverySignal::ScanNow) => {
+                            // Set cancel flag to true to abort the current background scan immediately
+                            current_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                            pending_scan = true;
+                            break;
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            break;
+                        }
+                    }
+                }
+
+                // Join the background handle to clean up
+                let _ = bg_handle.join();
+
+                // Signal the sync thread to stop and join it
+                sync_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = sync_handle.join();
             }
         }
     });
@@ -1208,7 +1419,7 @@ fn arp_scan(
     interface_name: &str,
     status_tx: &mpsc::Sender<String>,
 ) -> HashMap<IpAddr, (String, String)> {
-    use pnet::datalink::{self, Channel, MacAddr};
+    use pnet::datalink::{Channel, MacAddr};
     use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
     use pnet::packet::arp::{ArpHardwareTypes, ArpOperations, ArpPacket, MutableArpPacket};
     use pnet::packet::{MutablePacket, Packet};
@@ -1365,6 +1576,7 @@ fn arp_scan(
 
 /// Native Windows SendARP probe to bypass firewalls and fill ARP table reliably
 #[cfg(windows)]
+#[allow(dead_code)]
 fn send_arp_probe(target: std::net::Ipv4Addr) -> Option<[u8; 6]> {
     use winapi::um::iphlpapi::SendARP;
     
@@ -1401,10 +1613,30 @@ fn should_resolve_hostname(ip: &IpAddr) -> bool {
     }
 }
 
+fn has_hex_segment(name: &str) -> bool {
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() < 10 { return false; }
+    for window in chars.windows(10) {
+        if window.iter().all(|c| c.is_ascii_hexdigit()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn select_best_hostname(candidates: &[String]) -> Option<String> {
+    if candidates.is_empty() { return None; }
+    let best = candidates.iter().enumerate().max_by_key(|(idx, c)| {
+        (!has_hex_segment(c), c.len(), std::cmp::Reverse(*idx))
+    }).map(|(_, c)| c.clone())?;
+    // Reject even the "best" candidate if it's still a hex string (e.g. a MAC-derived .local name)
+    if has_hex_segment(&best) { None } else { Some(best) }
+}
+
 /// Probe a single Apple device via unicast mDNS to extract model info.
 /// Sends QU-bit queries directly to the target IP on port 5353.
 #[cfg(windows)]
-fn probe_apple_unicast_mdns(target: std::net::Ipv4Addr, timeout_ms: u64) -> Option<(String, HashMap<String, String>)> {
+fn probe_apple_unicast_mdns(target: std::net::Ipv4Addr, timeout_ms: u64) -> Option<(String, DeviceDetails)> {
     use std::net::UdpSocket;
 
     let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -1429,8 +1661,9 @@ fn probe_apple_unicast_mdns(target: std::net::Ipv4Addr, timeout_ms: u64) -> Opti
         let _ = sock.send_to(&query, target_addr);
     }
 
-    let mut hostname = None;
-    let mut metadata = HashMap::new();
+    let mut a_candidates = Vec::new();
+    let mut instance_candidates = Vec::new();
+    let mut metadata = DeviceDetails::default();
     let start = std::time::Instant::now();
     let mut sent_a_query = false;
 
@@ -1442,23 +1675,21 @@ fn probe_apple_unicast_mdns(target: std::net::Ipv4Addr, timeout_ms: u64) -> Opti
                 // Extract hostname from A records
                 for (name, _ip) in parse_mdns_a_records(data) {
                     let clean = name.trim_end_matches(".local").trim_end_matches('.').to_string();
-                    if !clean.is_empty() && hostname.is_none() {
-                        hostname = Some(clean.clone());
-                        // Follow-up: send a direct A record query for this hostname
-                        // to reliably resolve its IP even if PTR failed
+                    if !clean.is_empty() {
                         if !sent_a_query {
                             let a_query = build_mdns_a_query(&format!("{}.local", clean), 600);
                             let _ = sock.send_to(&a_query, target_addr);
                             sent_a_query = true;
                         }
+                        a_candidates.push(clean);
                     }
                 }
                 // Extract hostname from PTR service instances too
                 for instance_name in parse_mdns_service_instances(data) {
                     let device_name = instance_name.split("._").next().unwrap_or("");
                     let device_name = device_name.split('@').last().unwrap_or(device_name).trim();
-                    if !device_name.is_empty() && hostname.is_none() {
-                        hostname = Some(device_name.to_string());
+                    if !device_name.is_empty() {
+                        instance_candidates.push(device_name.to_string());
                     }
                 }
                 // Extract model info from TXT records
@@ -1466,16 +1697,16 @@ fn probe_apple_unicast_mdns(target: std::net::Ipv4Addr, timeout_ms: u64) -> Opti
                     for (key, value) in &pairs {
                         match key.as_str() {
                             "rpmd" | "model" | "wmodel" => {
-                                metadata.insert("model_code".to_string(), value.clone());
+                                metadata.properties.insert("model_code".to_string(), value.clone());
                                 if let Some(human) = resolve_apple_model(value) {
-                                    metadata.insert("model".to_string(), human.to_string());
+                                    metadata.properties.insert("model".to_string(), human.to_string());
                                 }
                             }
                             "am" => {
-                                if !metadata.contains_key("model_code") {
-                                    metadata.insert("model_code".to_string(), value.clone());
+                                if !metadata.properties.contains_key("model_code") {
+                                    metadata.properties.insert("model_code".to_string(), value.clone());
                                     if let Some(human) = resolve_apple_model(value) {
-                                        metadata.insert("model".to_string(), human.to_string());
+                                        metadata.properties.insert("model".to_string(), human.to_string());
                                     }
                                 }
                             }
@@ -1483,15 +1714,17 @@ fn probe_apple_unicast_mdns(target: std::net::Ipv4Addr, timeout_ms: u64) -> Opti
                         }
                     }
                     // Track services from unicast probe responses
-                    if record_name.contains("_rdlink") { metadata.entry("services".to_string()).or_insert_with(String::new); add_service(metadata.get_mut("services").unwrap(), "Rapport"); }
-                    if record_name.contains("_companion-link") { metadata.entry("services".to_string()).or_insert_with(String::new); add_service(metadata.get_mut("services").unwrap(), "Apple Companion"); }
-                    if record_name.contains("_apple-mobdev2") { metadata.entry("services".to_string()).or_insert_with(String::new); add_service(metadata.get_mut("services").unwrap(), "iPhone/iPad"); }
-                    if record_name.contains("_continuity") { metadata.entry("services".to_string()).or_insert_with(String::new); add_service(metadata.get_mut("services").unwrap(), "Continuity"); }
+                    if record_name.contains("_rdlink") { metadata.services.insert("Rapport".to_string()); }
+                    if record_name.contains("_companion-link") { metadata.services.insert("Apple Companion".to_string()); }
+                    if record_name.contains("_apple-mobdev2") { metadata.services.insert("iPhone/iPad".to_string()); }
+                    if record_name.contains("_continuity") { metadata.services.insert("Continuity".to_string()); }
                 }
             }
             Err(_) => {
-                // Timeout on recv — if we have a hostname, send follow-up A query
-                if let Some(ref name) = hostname {
+                // Timeout on recv — if we have candidates, send follow-up A query on the best so far
+                let current_best = select_best_hostname(&a_candidates)
+                    .or_else(|| select_best_hostname(&instance_candidates));
+                if let Some(ref name) = current_best {
                     if !sent_a_query {
                         let a_query = build_mdns_a_query(&format!("{}.local", name), 601);
                         let _ = sock.send_to(&a_query, target_addr);
@@ -1504,8 +1737,24 @@ fn probe_apple_unicast_mdns(target: std::net::Ipv4Addr, timeout_ms: u64) -> Opti
         }
     }
 
-    if hostname.is_some() || !metadata.is_empty() {
-        Some((hostname.unwrap_or_default(), metadata))
+    let best_a = select_best_hostname(&a_candidates);
+    let best_inst = select_best_hostname(&instance_candidates);
+
+    let final_hostname = match (best_a, best_inst) {
+        (Some(a), Some(inst)) => {
+            if has_hex_segment(&a) && !has_hex_segment(&inst) {
+                Some(inst)
+            } else {
+                Some(a)
+            }
+        }
+        (Some(a), None) => Some(a),
+        (None, Some(inst)) => Some(inst),
+        (None, None) => None,
+    };
+
+    if final_hostname.is_some() || !metadata.is_empty() {
+        Some((final_hostname.unwrap_or_default(), metadata))
     } else {
         None
     }
@@ -1578,19 +1827,21 @@ fn passive_mdns_listener(
     duration: Duration,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
     interface_ip: std::net::Ipv4Addr,
-) -> (HashMap<IpAddr, String>, HashMap<IpAddr, HashMap<String, String>>) {
+    hosts: Arc<DashMap<IpAddr, String>>,
+    metadata: Arc<DashMap<IpAddr, DeviceDetails>>,
+) {
     use std::net::{SocketAddr, UdpSocket, Ipv4Addr};
-    let mut hosts = HashMap::new();
-    let mut metadata: HashMap<IpAddr, HashMap<String, String>> = HashMap::new();
+    let mut local_hosts = HashMap::new();
+    let mut local_metadata = HashMap::new();
 
     let sock = match socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP)) {
         Ok(s) => s,
-        Err(_) => return (hosts, metadata),
+        Err(_) => return,
     };
     let _ = sock.set_reuse_address(true);
     let bind_addr: SocketAddr = "0.0.0.0:5353".parse().unwrap();
     if sock.bind(&bind_addr.into()).is_err() {
-        return (hosts, metadata);
+        return;
     }
     
     let mdns_group = Ipv4Addr::new(224, 0, 0, 251);
@@ -1606,102 +1857,14 @@ fn passive_mdns_listener(
         match socket.recv_from(&mut buf) {
             Ok((len, src_addr)) => {
                 let data = &buf[..len];
-                let mut packet_ipv4 = None;
                 if let IpAddr::V4(src_v4) = src_addr.ip() {
-                    packet_ipv4 = Some(src_v4);
-                }
-
-                for (name, resolved_ip) in parse_mdns_a_records(data) {
-                    let clean = name.trim_end_matches(".local").trim_end_matches('.').to_string();
-                    if !clean.is_empty() {
-                        if let IpAddr::V4(v4) = resolved_ip {
-                            packet_ipv4 = Some(v4);
-                            hosts.entry(IpAddr::V4(v4)).or_insert(clean);
-                        }
+                    process_mdns_packet(data, src_v4, &mut local_hosts, &mut local_metadata);
+                    // Write to the shared DashMaps in real-time
+                    for (ip, name) in &local_hosts {
+                        hosts.insert(*ip, name.clone());
                     }
-                }
-
-                if let Some(src_v4) = packet_ipv4 {
-                    for instance in parse_mdns_service_instances(data) {
-                        let clean = instance.trim_end_matches(".local").trim_end_matches('.').to_string();
-                        let device_name = clean.split("._").next().unwrap_or(&clean);
-                        let device_name = device_name.split('@').last().unwrap_or(device_name);
-                        let device_name = if let Some(space_pos) = device_name.find(' ') {
-                            let pre = &device_name[..space_pos];
-                            if pre.contains('.') || pre.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
-                                device_name[space_pos + 1..].trim()
-                            } else {
-                                device_name.trim()
-                            }
-                        } else {
-                            device_name.trim()
-                        }.to_string();
-
-                        if !device_name.is_empty() {
-                            hosts.entry(IpAddr::V4(src_v4)).or_insert(device_name);
-                        }
-                    }
-
-                    for (record_name, pairs) in parse_mdns_txt_records(data) {
-                        let ip_key = IpAddr::V4(src_v4);
-                        let meta = metadata.entry(ip_key).or_insert_with(HashMap::new);
-                        for (key, value) in &pairs {
-                            match key.as_str() {
-                                "rpmd" | "model" | "wmodel" => {
-                                    meta.insert("model_code".to_string(), value.clone());
-                                    if let Some(human) = resolve_apple_model(value) {
-                                        meta.insert("model".to_string(), human.to_string());
-                                    }
-                                }
-                                "am" => {
-                                    if !meta.contains_key("model_code") {
-                                        meta.insert("model_code".to_string(), value.clone());
-                                        if let Some(human) = resolve_apple_model(value) {
-                                            meta.insert("model".to_string(), human.to_string());
-                                        }
-                                    }
-                                }
-                                "osxvers" => {
-                                    let os_name = match value.as_str() {
-                                        "24" => "macOS 15 Sequoia",
-                                        "23" => "macOS 14 Sonoma",
-                                        "22" => "macOS 13 Ventura",
-                                        "21" => "macOS 12 Monterey",
-                                        "20" => "macOS 11 Big Sur",
-                                        _ => value.as_str(),
-                                    };
-                                    meta.insert("os_version".to_string(), os_name.to_string());
-                                }
-                                "fn" => { meta.insert("friendly_name".to_string(), value.clone()); }
-                                "md" => {
-                                    if !meta.contains_key("model") {
-                                        meta.insert("model".to_string(), value.clone());
-                                    }
-                                }
-                                "srcvers" | "vs" => { meta.insert("firmware".to_string(), value.clone()); }
-                                "ci" => {
-                                    let category = match value.as_str() {
-                                        "1" => "Other", "2" => "Bridge", "3" => "Fan", "4" => "Garage Door",
-                                        "5" => "Lightbulb", "6" => "Door Lock", "7" => "Outlet", "8" => "Switch",
-                                        "9" => "Thermostat", "10" => "Sensor", "11" => "Security System", "12" => "Door",
-                                        "13" => "Window", "14" => "Window Covering", "17" => "Sprinkler", "28" => "TV",
-                                        "32" => "Router", _ => value.as_str(),
-                                    };
-                                    meta.insert("homekit_category".to_string(), category.to_string());
-                                }
-                                _ => {}
-                            }
-                        }
-                        if record_name.contains("_airplay") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "AirPlay"); }
-                        if record_name.contains("_raop") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "AirPlay Audio"); }
-                        if record_name.contains("_hap") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "HomeKit"); }
-                        if record_name.contains("_googlecast") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "Chromecast"); }
-                        if record_name.contains("_spotify") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "Spotify Connect"); }
-                        if record_name.contains("_companion-link") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "Apple Companion"); }
-                        if record_name.contains("_apple-mobdev2") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "iPhone/iPad"); }
-                        if record_name.contains("_airdrop") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "AirDrop"); }
-                        if record_name.contains("_remotepairing") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "iPhone"); }
-                        if record_name.contains("_continuity") { add_service(meta.entry("services".to_string()).or_insert_with(String::new), "Continuity"); }
+                    for (ip, details) in &local_metadata {
+                        metadata.insert(*ip, details.clone());
                     }
                 }
             }
@@ -1709,26 +1872,375 @@ fn passive_mdns_listener(
         }
     }
     
-    for meta in metadata.values_mut() {
-        if let Some(svc) = meta.get_mut("services") {
-            *svc = svc.trim_end_matches(", ").to_string();
-        }
+    let _ = socket.leave_multicast_v4(&mdns_group, &interface_ip);
+}
+
+/// Wake stale Apple/unknown iPhones in sleep-proxy mode and probe them
+#[cfg(windows)]
+fn wake_iphones_and_probe(
+    stale_candidates: &[std::net::Ipv4Addr],
+    interface_v4: std::net::Ipv4Addr,
+    device_metadata: &Arc<DashMap<IpAddr, DeviceDetails>>,
+    harvested_results: &mut HashMap<IpAddr, (String, String)>,
+    new_map: &mut HashMap<IpAddr, DeviceInfo>,
+    status_tx: &mpsc::Sender<String>,
+) {
+    if stale_candidates.is_empty() { return; }
+    
+    let _ = status_tx.send(format!("Waking and probing {} stale Apple/unknown device(s)...", stale_candidates.len()));
+    
+    // 1. Send _sleep-proxy._udp.local PTR query to multicast group
+    if let Ok(sock) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP)) {
+        let _ = sock.bind(&"0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap().into());
+        let _ = sock.set_multicast_if_v4(&interface_v4);
+        let mdns_multicast_addr = socket2::SockAddr::from("224.0.0.251:5353".parse::<std::net::SocketAddr>().unwrap());
+        let query = build_mdns_service_query("_sleep-proxy._udp.local", 1234);
+        let _ = sock.send_to(&query, &mdns_multicast_addr);
     }
     
-    let _ = socket.leave_multicast_v4(&mdns_group, &interface_ip);
+    // Give sleep proxies a tiny moment to wake devices
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    
+    // 2. Send unicast QU probes to the candidates in parallel using 4-second response window
+    let (result_tx, result_rx) = mpsc::channel();
+    let ips_to_probe = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(stale_candidates.to_vec())));
+    
+    thread::scope(|s| {
+        for _ in 0..8 {
+            let ips = Arc::clone(&ips_to_probe);
+            let tx = result_tx.clone();
+            s.spawn(move || {
+                loop {
+                    let next_ip = {
+                        let mut guard = ips.lock().unwrap();
+                        guard.pop_front()
+                    };
+                    match next_ip {
+                        Some(v4) => {
+                            // Use 4-second response window
+                            let result = probe_apple_unicast_mdns(v4, 4000);
+                            let _ = tx.send((v4, result));
+                        }
+                        None => break,
+                    }
+                }
+            });
+        }
+    });
+    drop(result_tx);
+    
+    for (v4, probe_result) in result_rx {
+        if let Some((hostname, meta)) = probe_result {
+            let ip_key = IpAddr::V4(v4);
+            
+            // Update new_map entry
+            if let Some(entry) = new_map.get_mut(&ip_key) {
+                if !hostname.is_empty() {
+                    entry.hostname = hostname.clone();
+                }
+                if meta.properties.contains_key("model") || meta.properties.contains_key("model_code") {
+                    if entry.vendor == "Unknown" || entry.vendor == "Randomized MAC" {
+                        entry.vendor = "Apple Inc.".to_string();
+                    }
+                }
+            }
 
-    (hosts, metadata)
+            if !meta.is_empty() {
+                let mut entry = device_metadata.entry(ip_key).or_insert_with(DeviceDetails::default);
+                for (k, v) in &meta.properties {
+                    entry.properties.insert(k.clone(), v.clone());
+                }
+                for svc in &meta.services {
+                    entry.services.insert(svc.clone());
+                }
+                drop(entry);
+                
+                if meta.properties.contains_key("model") || meta.properties.contains_key("model_code") {
+                    if let Some((_mac, vendor)) = harvested_results.get_mut(&ip_key) {
+                        if vendor == "Randomized MAC" || vendor == "Unknown" {
+                            *vendor = "Apple Inc.".to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Device category classification
+// ---------------------------------------------------------------------------
+
+/// Classify a device into a compact category tag based on vendor, hostname, and metadata.
+pub fn classify_device_category(
+    vendor: &str,
+    hostname: &str,
+    meta: Option<&DeviceDetails>,
+) -> Option<&'static str> {
+    let v = vendor.to_ascii_lowercase();
+    let h = hostname.to_ascii_lowercase();
+
+    let model = meta.and_then(|m| m.get("model").map(|s| s.to_ascii_lowercase()))
+        .unwrap_or_default();
+    let friendly = meta.and_then(|m| m.get("friendly_name").map(|s| s.to_ascii_lowercase()))
+        .unwrap_or_default();
+    let services: Vec<String> = meta.map(|m| m.services.iter().map(|s| s.to_ascii_lowercase()).collect())
+        .unwrap_or_default();
+
+    let any_contains = |needle: &str| {
+        v.contains(needle) || h.contains(needle)
+            || model.contains(needle) || friendly.contains(needle)
+            || services.iter().any(|s| s.contains(needle))
+    };
+
+    // Most-specific matches first
+    if any_contains("router") || any_contains("gateway") || h == "eerogw" || h == "eero gateway"
+        || v.contains("eero") || v.contains("ubiquiti") || v.contains("netgear") && h.contains("router")
+        || v.contains("cisco") && (h.contains("router") || h.contains("gateway"))
+    {
+        return Some("Router");
+    }
+    if any_contains("thermostat") || v.contains("ecobee") || v.contains("nest") && h.contains("therm") {
+        return Some("Thermostat");
+    }
+    if any_contains("camera") || any_contains("doorbell") || v.contains("ring") || v.contains("arlo")
+        || v.contains("wyze") || v.contains("reolink") || v.contains("hikvision") || v.contains("dahua")
+    {
+        return Some("Camera");
+    }
+    if any_contains("printer") || any_contains("laserjet") || v.contains("hp inc") || v.contains("canon")
+        || v.contains("brother") || v.contains("epson") || v.contains("lexmark") || h.starts_with("npi")
+    {
+        return Some("Printer");
+    }
+    if any_contains("playstation") || any_contains("xbox") || any_contains("nintendo")
+        || v.contains("sony interactive") || v.contains("microsoft") && h.contains("xbox")
+    {
+        return Some("Console");
+    }
+    if any_contains("apple tv") || any_contains("appletv") || any_contains("fire tv")
+        || any_contains("chromecast") || any_contains("roku") || v.contains("google") && h.contains("tv")
+        || v.contains("amazon") && h.contains("tv") || any_contains("shield")
+    {
+        return Some("Streamer");
+    }
+    if any_contains("homepod") || any_contains("sonos") || any_contains("bose soundbar")
+        || any_contains("airplay") && !any_contains("iphone") && !any_contains("macbook")
+        || v.contains("sonos") || v.contains("bose") && any_contains("speaker")
+        || v.contains("denon") || v.contains("harman") || v.contains("bang & olufsen")
+    {
+        return Some("Speaker");
+    }
+    if any_contains("samsung tv") || any_contains("lg tv") || any_contains("vizio") || any_contains("tcl tv")
+        || friendly.contains("tv") && (v.contains("samsung") || v.contains("lg electronics"))
+        || v.contains("samsung electronics") && (
+            h.contains("frame") || h.contains("qled") || h.contains("oled")
+            || h.contains("crystal") || h.contains("serif") || h.contains("terrace")
+            || h.starts_with("samsung q") || h.starts_with("samsung un")
+            || h.starts_with("samsung the") || h.starts_with("samsung s9")
+        )
+        || v.contains("lg electronics") && (h.contains("oled") || h.contains("nanocell") || h.contains("qned"))
+    {
+        return Some("TV");
+    }
+    if any_contains("echo") && (v.contains("amazon") || h.contains("echo"))
+        || any_contains("alexa") || h.starts_with("echo-") || h.starts_with("echo ")
+    {
+        return Some("Echo");
+    }
+    if any_contains("smart plug") || any_contains("outlet") || any_contains("kasa")
+        || v.contains("tp-link") && any_contains("plug") || v.contains("wemo") || v.contains("belkin")
+    {
+        return Some("SmartPlug");
+    }
+    if any_contains("hub") || any_contains("bridge") && !h.contains("air")
+        || v.contains("phillips") || v.contains("philips lighting") || v.contains("signify")
+        || v.contains("samsung smarthings") || v.contains("smartthings")
+        || h.contains("hue bridge") || h.contains("hue hub")
+    {
+        return Some("Hub");
+    }
+    if any_contains("sprinkler") || any_contains("rachio") || v.contains("rachio") {
+        return Some("Sprinkler");
+    }
+    if any_contains("garage") || v.contains("chamberlain") || v.contains("liftmaster") {
+        return Some("Garage");
+    }
+    if any_contains("washer") || any_contains("dryer") || any_contains("refrigerator")
+        || any_contains("dishwasher") || any_contains("oven") || any_contains("microwave")
+    {
+        return Some("Appliance");
+    }
+    if any_contains("iphone") || any_contains("galaxy") || any_contains("pixel phone")
+        || h.contains("android") && (h.contains("phone") || h.contains("mobile"))
+    {
+        return Some("Phone");
+    }
+    if any_contains("ipad") || any_contains("macbook")
+        || any_contains("imac") || any_contains("mac mini") || any_contains("mac pro")
+        || any_contains("windows") || any_contains("linux") && !any_contains("router")
+        || any_contains("android")
+    {
+        return Some("PC");
+    }
+    // Catch-all for ESP/Arduino/unknown IoT
+    if v.contains("espressif") || v.contains("arduino") || any_contains("iot") {
+        return Some("IoT");
+    }
+
+    None
+}
+
+// ---------------------------------------------------------------------------
+// HTTP banner scanning — tries common ports and extracts device identity
+// ---------------------------------------------------------------------------
+
+/// Extract the content of the first <title> tag from HTML.
+fn extract_html_title(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let start = lower.find("<title>")? + 7;
+    let end = lower[start..].find("</title>").map(|i| start + i)?;
+    let title = html[start..end].trim().to_string();
+    if title.is_empty() { None } else { Some(title) }
+}
+
+/// Attempt a quick HTTP GET, returning (status, headers_as_text, body_preview).
+/// Timeout is 2 seconds — we don't want to block the scan.
+fn http_get_with_timeout(url: &str) -> Option<(u16, String, String)> {
+    let resp = ureq::get(url)
+        .timeout(std::time::Duration::from_secs(2))
+        .call()
+        .ok()?;
+    let status = resp.status();
+    let server_header = resp.header("Server").unwrap_or("").to_string();
+    let content_type = resp.header("Content-Type").unwrap_or("").to_string();
+    let headers = format!("Server: {}\nContent-Type: {}", server_header, content_type);
+    let body = resp.into_string().unwrap_or_default();
+    let body = if body.len() > 8192 { body[..8192].to_string() } else { body };
+    Some((status, headers, body))
+}
+
+/// Parse Sonos/UPnP XML description for friendlyName, modelName, manufacturer.
+fn parse_xml_description(xml: &str) -> (Option<String>, Option<String>, Option<String>) {
+    fn extract_tag<'a>(xml: &'a str, tag: &str) -> Option<String> {
+        let open = format!("<{}>", tag);
+        let close = format!("</{}>", tag);
+        let start = xml.find(&open)? + open.len();
+        let end = xml[start..].find(&close).map(|i| start + i)?;
+        let v = xml[start..end].trim().to_string();
+        if v.is_empty() { None } else { Some(v) }
+    }
+    (
+        extract_tag(xml, "friendlyName"),
+        extract_tag(xml, "modelName"),
+        extract_tag(xml, "manufacturer"),
+    )
+}
+
+/// Scan a list of IPs over HTTP to collect device banners, friendly names, and model info.
+/// Results are written directly into `meta`.
+/// Runs at most 8 concurrent threads per batch to avoid hammering the router and
+/// to work around Windows ignoring ureq's timeout on firewall-dropped ports.
+fn http_banner_scan(
+    ips: &[IpAddr],
+    meta: &Arc<DashMap<IpAddr, DeviceDetails>>,
+    devices: &Arc<DashMap<IpAddr, DeviceInfo>>,
+    status_tx: &mpsc::Sender<String>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Skip IPs that already have HTTP banner data from a previous scan this session
+    let scan_ips: Vec<IpAddr> = ips.iter().copied()
+        .filter(|ip| {
+            meta.get(ip)
+                .map(|m| !m.properties.contains_key("http_server")
+                       && !m.properties.contains_key("html_title")
+                       && !m.properties.contains_key("friendly_name"))
+                .unwrap_or(true)
+        })
+        .collect();
+
+    if scan_ips.is_empty() { return; }
+
+    let total = scan_ips.len();
+    let done = Arc::new(AtomicUsize::new(0));
+
+    // Process in batches of 8 — wait for each batch to finish before starting the next
+    for batch in scan_ips.chunks(8) {
+        let handles: Vec<_> = batch.iter().copied().map(|ip| {
+            let meta_r = Arc::clone(meta);
+            let devices_r = Arc::clone(devices);
+            let done_r = Arc::clone(&done);
+            let status_r = status_tx.clone();
+            let total = total;
+
+            thread::spawn(move || {
+                // Port 1400 = Sonos device description
+                let sonos_url = format!("http://{}:1400/xml/device_description.xml", ip);
+                if let Some((_s, _h, body)) = http_get_with_timeout(&sonos_url) {
+                    let (friendly, model, mfr) = parse_xml_description(&body);
+                    let mut e = meta_r.entry(ip).or_insert_with(DeviceDetails::default);
+                    if let Some(n) = friendly { e.properties.entry("friendly_name".into()).or_insert(n); }
+                    if let Some(m) = model    { e.properties.entry("model".into()).or_insert(m); }
+                    if let Some(f) = mfr      { e.properties.entry("manufacturer".into()).or_insert(f); }
+                }
+
+                // Ports 80, 8080: UPnP XML then HTML fallback
+                for port in &[80u16, 8080u16] {
+                    let xml_url = format!("http://{}:{}/xml/device_description.xml", ip, port);
+                    if let Some((_s, _h, body)) = http_get_with_timeout(&xml_url) {
+                        let (friendly, model, mfr) = parse_xml_description(&body);
+                        let mut e = meta_r.entry(ip).or_insert_with(DeviceDetails::default);
+                        if let Some(n) = friendly { e.properties.entry("friendly_name".into()).or_insert(n); }
+                        if let Some(m) = model    { e.properties.entry("model".into()).or_insert(m); }
+                        if let Some(f) = mfr      { e.properties.entry("manufacturer".into()).or_insert(f); }
+                    }
+
+                    let root_url = format!("http://{}:{}/", ip, port);
+                    if let Some((_s, headers, body)) = http_get_with_timeout(&root_url) {
+                        if let Some(server) = headers.lines()
+                            .find(|l| l.starts_with("Server: "))
+                            .map(|l| l[8..].trim().to_string())
+                            .filter(|s| !s.is_empty())
+                        {
+                            meta_r.entry(ip).or_insert_with(DeviceDetails::default)
+                                .properties.entry("http_server".into()).or_insert(server);
+                        }
+                        if let Some(title) = extract_html_title(&body) {
+                            meta_r.entry(ip).or_insert_with(DeviceDetails::default)
+                                .properties.entry("html_title".into()).or_insert(title.clone());
+                            if let Some(mut dev) = devices_r.get_mut(&ip) {
+                                if dev.hostname == "\u{2014}" || dev.hostname == "Resolving..." {
+                                    dev.hostname = title;
+                                }
+                            }
+                        }
+                        break; // port 80 responded — skip 8080
+                    }
+                }
+
+                let n = done_r.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % 8 == 0 || n == total {
+                    let _ = status_r.send(format!("HTTP banner scan ({}/{})...", n, total));
+                }
+            })
+        }).collect();
+
+        // Wait for this batch of 8 before starting the next
+        for h in handles { let _ = h.join(); }
+    }
 }
 
 fn perform_scan(
-    passive_discovery: &Arc<Mutex<HashMap<IpAddr, DeviceInfo>>>,
-    active_discovery: &Arc<Mutex<HashMap<IpAddr, DeviceInfo>>>,
-    device_metadata: &Arc<Mutex<DeviceMetadata>>,
+    passive_discovery: &Arc<DashMap<IpAddr, DeviceInfo>>,
+    active_discovery: &Arc<DashMap<IpAddr, DeviceInfo>>,
+    device_metadata: &Arc<DashMap<IpAddr, DeviceDetails>>,
     interface_name: &str,
     network_name: &str,
     status_tx: &mpsc::Sender<String>,
-    _alert_tx: &mpsc::Sender<String>
-) {
+    alert_tx: &mpsc::Sender<String>,
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+) -> thread::JoinHandle<()> {
     let _ = status_tx.send("Initializing...".to_string());
 
     // Resolve capture interface IP for multicast
@@ -1750,105 +2262,28 @@ fn perform_scan(
 
     // Spawn passive mDNS listener to capture unsolicited Apple announcements
     // during the entire scan window (ARP sweep + probes)
+    let passive_hosts = Arc::new(DashMap::new());
+    let passive_meta = Arc::new(DashMap::new());
+    let passive_hosts_clone = Arc::clone(&passive_hosts);
+    let passive_meta_clone = Arc::clone(&passive_meta);
+
     let mdns_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mdns_stop_clone = Arc::clone(&mdns_stop);
     let mdns_listener_handle = thread::spawn(move || {
-        passive_mdns_listener(Duration::from_secs(60), mdns_stop_clone, interface_v4)
+        passive_mdns_listener(Duration::from_secs(60), mdns_stop_clone, interface_v4, passive_hosts_clone, passive_meta_clone)
     });
 
-    // Use the new arp_scan to discover devices on the local subnet directly via pnet
-    let mut harvested_results = arp_scan(interface_name, status_tx);
-
-    // Probe ALL ARP-discovered devices via unicast mDNS for model identification
-    {
-        let probe_ips: Vec<std::net::Ipv4Addr> = harvested_results.iter()
-            .filter_map(|(ip, _)| match ip {
-                IpAddr::V4(v4) => Some(*v4),
-                _ => None,
-            })
-            .collect();
-
-        if !probe_ips.is_empty() {
-            let _ = status_tx.send(format!("Probing {} device(s) via mDNS...", probe_ips.len()));
-            
-            let (result_tx, result_rx) = mpsc::channel();
-            let ips_to_probe = Arc::new(Mutex::new(probe_ips.into_iter()));
-            
-            thread::scope(|s| {
-                for _ in 0..8 {
-                    let ips = Arc::clone(&ips_to_probe);
-                    let tx = result_tx.clone();
-                    s.spawn(move || {
-                        loop {
-                            let next_ip = {
-                                let mut lock = ips.lock().unwrap();
-                                lock.next()
-                            };
-                            match next_ip {
-                                Some(v4) => {
-                                    let result = probe_apple_unicast_mdns(v4, 1200);
-                                    let _ = tx.send((v4, result));
-                                }
-                                None => break,
-                            }
-                        }
-                    });
-                }
-            });
-            drop(result_tx);
-            
-            for (v4, probe_result) in result_rx {
-                if let Some((_hostname, meta)) = probe_result {
-                    let ip_key = IpAddr::V4(v4);
-                    if !meta.is_empty() {
-                        if let Ok(mut device_meta) = device_metadata.lock() {
-                            let entry = device_meta.entry(ip_key).or_insert_with(HashMap::new);
-                            for (k, v) in &meta {
-                                entry.insert(k.clone(), v.clone());
-                            }
-                        }
-                        if meta.contains_key("model") || meta.contains_key("model_code") {
-                            if let Some((_mac, vendor)) = harvested_results.get_mut(&ip_key) {
-                                if vendor == "Randomized MAC" || vendor == "Unknown" {
-                                    *vendor = "Apple Inc.".to_string();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Stop the passive listener and merge results
-    mdns_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    if let Ok((passive_hosts, passive_meta)) = mdns_listener_handle.join() {
-        for (ip, _hostname) in &passive_hosts {
-            if let IpAddr::V4(_v4) = ip {
-                if !harvested_results.contains_key(ip) {
-                    harvested_results.insert(*ip, ("Unknown".to_string(), "Apple Device".to_string()));
-                }
-            }
-        }
-        if let Ok(mut meta) = device_metadata.lock() {
-            for (ip, txt_meta) in passive_meta {
-                let entry = meta.entry(ip).or_insert_with(HashMap::new);
-                for (k, v) in txt_meta { 
-                    entry.insert(k, v); 
-                }
-            }
-        }
-    }
+    // Stage 1: Read the Windows ARP table FIRST (Fix 2)
+    let mut new_map = HashMap::new();
+    let mut snapshot: Vec<IpAddr> = Vec::new();
+    let mut stale_apple_candidates = Vec::new();
 
     let _ = status_tx.send("Reading ARP table...".to_string());
     let mut table_ptr: *mut MIB_IPNET_TABLE2 = std::ptr::null_mut();
     unsafe {
         if GetIpNetTable2(AF_UNSPEC as u16, &mut table_ptr as *mut _ as *mut _) == 0 {
             let table = &*table_ptr;
-            let mut new_map = HashMap::new();
-            let mut snapshot: Vec<IpAddr> = Vec::new();
 
-            // Stage 1: Identification of the active interface index for filtering
             let target_if_index = pnet::datalink::interfaces().into_iter()
                 .find(|i| i.name == interface_name || i.description == interface_name)
                 .map(|i| i.index);
@@ -1859,13 +2294,10 @@ fn perform_scan(
             for i in 0..num_entries {
                 let row = &*base_ptr.add(i);
                 
-                // Filter by Interface Index
                 if let Some(target_idx) = target_if_index {
                     if row.InterfaceIndex != target_idx { continue; }
                 }
 
-                // Filter by Neighbor State — accept any state indicating the device
-                // has been on the network (not just REACHABLE which decays in seconds)
                 let state = row.State as u32;
                 if state != NLNS_REACHABLE && state != NLNS_PERMANENT
                     && state != NLNS_STALE && state != NLNS_DELAY && state != NLNS_PROBE {
@@ -1883,7 +2315,6 @@ fn perform_scan(
                     continue;
                 };
 
-                // Problem 2 Fix: Filter by RFC 1918 + link-local + exclude 0.0.0.0
                 if !crate::display::is_local_ip(&ip) {
                     continue;
                 }
@@ -1901,6 +2332,18 @@ fn perform_scan(
                 }
 
                 let vendor = crate::oui::get_vendor(&mac_str);
+                
+                // Identify STALE iPhones/devices for wake/probe
+                if state == NLNS_STALE {
+                    let is_apple = vendor.to_lowercase().contains("apple");
+                    let is_unknown = vendor == "Unknown" || vendor == "Randomized MAC";
+                    if is_apple || is_unknown {
+                        if let IpAddr::V4(v4) = ip {
+                            stale_apple_candidates.push(v4);
+                        }
+                    }
+                }
+
                 let hostname = if should_resolve_hostname(&ip) {
                     snapshot.push(ip);
                     "Resolving...".to_string()
@@ -1917,388 +2360,881 @@ fn perform_scan(
                     last_seen_unix: default_unix_now(),
                 });
             }
-
-            // Merge harvested results (SendARP results)
-            for (ip, (mac, vendor)) in &harvested_results {
-                new_map.insert(*ip, DeviceInfo {
-                    mac: mac.clone(),
-                    vendor: vendor.clone(),
-                    hostname: "Resolving...".to_string(),
-                    miss_count: 0,
-                    last_seen: std::time::Instant::now(),
-                    last_seen_unix: default_unix_now(),
-                });
-                if !snapshot.contains(ip) && should_resolve_hostname(ip) {
-                    snapshot.push(*ip);
-                }
-            }
-
-            // Problem 1 Fix: Merge passive_discovery into scan results at scan-time
-            if let Ok(passive) = passive_discovery.lock() {
-                for (ip, entry) in passive.iter() {
-                    if !new_map.contains_key(ip) {
-                        new_map.insert(*ip, entry.clone());
-                    }
-                }
-            }
-
-            // Stage 3: Merge scan results into active_discovery with persistence
-            // Devices already in the map keep their resolved hostnames and metadata.
-            // Only miss_count and last_seen are updated based on scan results.
-            let mut devices = active_discovery.lock().unwrap();
-
-            // Age devices that were NOT found in this scan
-            for (ip, entry) in devices.iter_mut() {
-                if !new_map.contains_key(ip) {
-                    // Device not found — increment miss count but preserve all other fields
-                    // (hostname, MAC, vendor, last_seen all stay as they were)
-                    entry.miss_count = entry.miss_count.saturating_add(1);
-                }
-                // Devices that WERE found are handled below in the merge loop
-            }
-
-            // Merge found devices: update what changed, preserve what was already resolved
-            for (ip, new_entry) in &new_map {
-                match devices.get_mut(ip) {
-                    Some(existing) => {
-                        // Preserve already-resolved hostname — only overwrite if new entry
-                        // actually has a real name (not the placeholder "Resolving...")
-                        if new_entry.hostname != "Resolving..." && new_entry.hostname != "\u{2014}" {
-                            existing.hostname = new_entry.hostname.clone();
-                        }
-                        // Update MAC/vendor in case they changed (e.g. MAC randomization)
-                        existing.mac = new_entry.mac.clone();
-                        existing.vendor = new_entry.vendor.clone();
-                        // Reset aging — device is confirmed present
-                        existing.miss_count = 0;
-                        existing.last_seen = std::time::Instant::now();
-                        existing.last_seen_unix = default_unix_now();
-                    }
-                    None => {
-                        // Brand new device — insert as-is
-                        devices.insert(*ip, new_entry.clone());
-                    }
-                }
-            }
-            let found = devices.len();
-            drop(devices);
-            let _ = status_tx.send(format!("Ready ({} discovered)", found));
-
-            // Baseline will be saved after hostname resolution finishes in the background thread
-
             FreeMibTable(table_ptr as *mut _);
+        }
+    }
 
-            // Fix 1: Run hostname resolution in background thread
-            // Resolution priority: mDNS → NetBIOS → PowerShell Resolve-DnsName → DNS reverse → "—"
-            let devices_clone = Arc::clone(active_discovery);
-            let mut snapshot_clone = snapshot.clone();
-            let network_name_clone = network_name.to_string();
+    // Populate initial harvested_results from ARP table
+    let mut harvested_results = HashMap::new();
+    for (ip, dev_info) in &new_map {
+        harvested_results.insert(*ip, (dev_info.mac.clone(), dev_info.vendor.clone()));
+    }
 
-            // Also retry hostname resolution for any cached devices still showing "—"
-            // This ensures baseline entries that failed resolution last time get another chance
-            {
-                let existing = active_discovery.lock().unwrap();
-                for (ip, dev) in existing.iter() {
-                    if (dev.hostname == "—" || dev.hostname == "Resolving...") && should_resolve_hostname(ip) {
-                        if !snapshot_clone.contains(ip) {
-                            snapshot_clone.push(*ip);
+    // Stage 2: Run active ARP scan sweep (returns map of discovered IPs -> (mac, vendor))
+    let active_arp_results = arp_scan(interface_name, status_tx);
+    
+    // Merge active ARP sweep results into harvested_results and new_map
+    for (ip, (mac, vendor)) in active_arp_results {
+        if !crate::display::is_local_ip(&ip) { continue; }
+        harvested_results.insert(ip, (mac.clone(), vendor.clone()));
+        new_map.insert(ip, DeviceInfo {
+            mac,
+            vendor,
+            hostname: "Resolving...".to_string(),
+            miss_count: 0,
+            last_seen: std::time::Instant::now(),
+            last_seen_unix: default_unix_now(),
+        });
+        if !snapshot.contains(&ip) && should_resolve_hostname(&ip) {
+            snapshot.push(ip);
+        }
+    }
+
+    // Stage 3: Dedicated iPhone wake probe (Fix 3, Part 2)
+    wake_iphones_and_probe(
+        &stale_apple_candidates,
+        interface_v4,
+        device_metadata,
+        &mut harvested_results,
+        &mut new_map,
+        status_tx,
+    );
+
+    // Stage 4: Merge passive listener hosts discovered so far (Fix 1)
+    for r in passive_hosts.iter() {
+        let ip = *r.key();
+        if !crate::display::is_local_ip(&ip) { continue; }
+        let name = r.value().clone();
+        harvested_results.entry(ip).or_insert_with(|| ("Unknown".to_string(), "Unknown".to_string()));
+        new_map.entry(ip).or_insert_with(|| DeviceInfo {
+            mac: "Unknown".to_string(),
+            vendor: "Unknown".to_string(),
+            hostname: name,
+            miss_count: 0,
+            last_seen: std::time::Instant::now(),
+            last_seen_unix: default_unix_now(),
+        });
+        if !snapshot.contains(&ip) && should_resolve_hostname(&ip) {
+            snapshot.push(ip);
+        }
+    }
+    for r in passive_meta.iter() {
+        let ip = *r.key();
+        if !crate::display::is_local_ip(&ip) { continue; }
+        let txt_meta = r.value();
+        let mut entry = device_metadata.entry(ip).or_insert_with(DeviceDetails::default);
+        for (k, v) in &txt_meta.properties {
+            entry.properties.insert(k.clone(), v.clone());
+        }
+        for svc in &txt_meta.services {
+            entry.services.insert(svc.clone());
+        }
+    }
+
+    // Stage 5: Run a short (3-second) collect_mdns_hostnames call (Fix 1)
+    let ips_for_collect: Vec<IpAddr> = harvested_results.keys().copied().collect();
+    let (mdns_collected_hosts, mdns_collected_meta) = collect_mdns_hostnames(&ips_for_collect, 3);
+    
+    // Merge new discoveries from 3-second collect_mdns_hostnames call
+    for (ip, hostname) in mdns_collected_hosts {
+        if !crate::display::is_local_ip(&ip) { continue; }
+        harvested_results.entry(ip).or_insert_with(|| ("Unknown".to_string(), "Unknown".to_string()));
+        new_map.entry(ip).or_insert_with(|| DeviceInfo {
+            mac: "Unknown".to_string(),
+            vendor: "Unknown".to_string(),
+            hostname: hostname.clone(),
+            miss_count: 0,
+            last_seen: std::time::Instant::now(),
+            last_seen_unix: default_unix_now(),
+        });
+        if !snapshot.contains(&ip) && should_resolve_hostname(&ip) {
+            snapshot.push(ip);
+        }
+    }
+    for (ip, meta) in mdns_collected_meta {
+        if !crate::display::is_local_ip(&ip) { continue; }
+        let mut entry = device_metadata.entry(ip).or_insert_with(DeviceDetails::default);
+        for (k, v) in meta.properties {
+            entry.properties.insert(k, v);
+        }
+        for svc in meta.services {
+            entry.services.insert(svc);
+        }
+    }
+
+    // Stage 6: Probe discovered devices via unicast mDNS
+    // Filter out devices that were already successfully wake-probed
+    let probe_ips: Vec<std::net::Ipv4Addr> = harvested_results.iter()
+        .filter_map(|(ip, _)| match ip {
+            IpAddr::V4(v4) => {
+                if let Some(meta) = device_metadata.get(ip) {
+                    if meta.properties.contains_key("model") {
+                        return None;
+                    }
+                }
+                Some(*v4)
+            }
+            _ => None,
+        })
+        .collect();
+
+    if !probe_ips.is_empty() {
+        let _ = status_tx.send(format!("Probing {} device(s) via mDNS...", probe_ips.len()));
+        
+        let (result_tx, result_rx) = mpsc::channel();
+        let ips_to_probe = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(probe_ips)));
+        
+        thread::scope(|s| {
+            for _ in 0..8 {
+                let ips = Arc::clone(&ips_to_probe);
+                let tx = result_tx.clone();
+                s.spawn(move || {
+                    loop {
+                        let next_ip = {
+                            let mut guard = ips.lock().unwrap();
+                            guard.pop_front()
+                        };
+                        match next_ip {
+                            Some(v4) => {
+                                let result = probe_apple_unicast_mdns(v4, 1200);
+                                let _ = tx.send((v4, result));
+                            }
+                            None => break,
+                        }
+                    }
+                });
+            }
+        });
+        drop(result_tx);
+        
+        for (v4, probe_result) in result_rx {
+            if let Some((hostname, meta)) = probe_result {
+                let ip_key = IpAddr::V4(v4);
+                
+                if let Some(entry) = new_map.get_mut(&ip_key) {
+                    if !hostname.is_empty() {
+                        entry.hostname = hostname.clone();
+                    }
+                    if meta.properties.contains_key("model") || meta.properties.contains_key("model_code") {
+                        if entry.vendor == "Unknown" || entry.vendor == "Randomized MAC" {
+                            entry.vendor = "Apple Inc.".to_string();
                         }
                     }
                 }
-            } // lock dropped
 
-            let meta_clone = Arc::clone(device_metadata);
-
-            thread::spawn(move || {
-                // Step 1: Run mDNS service browsing (8s scan) - primary method for IoT devices
-                // Extended from 5s to 8s to catch iPhones in low-power/sleep state (3-6s response)
-                // This now also collects TXT record metadata (device models, firmware, etc.)
-                let (mdns_hostnames, mdns_txt_meta) = collect_mdns_hostnames(&snapshot_clone, 8);
-                let mdns_clone = Arc::new(mdns_hostnames);
-
-                // Prompt C fix: Insert mDNS-discovered devices that were missed by ARP/ping sweep
-                // iPhones with screen off often don't respond to SendARP but do respond to mDNS
-                {
-                    let mut mdns_only_ips: Vec<IpAddr> = Vec::new();
-                    if let Ok(mut map) = devices_clone.lock() {
-                        for (ip, mdns_name) in mdns_clone.iter() {
-                            if !map.contains_key(ip) {
-                                map.insert(*ip, DeviceInfo {
-                                    mac: "Unknown".to_string(),
-                                    vendor: "Apple Device".to_string(),
-                                    hostname: mdns_name.clone(),
-                                    miss_count: 0,
-                                    last_seen: std::time::Instant::now(),
-                                    last_seen_unix: default_unix_now(),
-                                });
-                                mdns_only_ips.push(*ip);
+                if !meta.is_empty() {
+                    let mut entry = device_metadata.entry(ip_key).or_insert_with(DeviceDetails::default);
+                    for (k, v) in &meta.properties {
+                        entry.properties.insert(k.clone(), v.clone());
+                    }
+                    for svc in &meta.services {
+                        entry.services.insert(svc.clone());
+                    }
+                    drop(entry);
+                    
+                    if meta.properties.contains_key("model") || meta.properties.contains_key("model_code") {
+                        if let Some((_mac, vendor)) = harvested_results.get_mut(&ip_key) {
+                            if vendor == "Randomized MAC" || vendor == "Unknown" {
+                                *vendor = "Apple Inc.".to_string();
                             }
                         }
                     }
-                    // Also add mDNS TXT metadata for these devices
-                    if !mdns_only_ips.is_empty() {
-                        for ip in &mdns_only_ips {
-                            if let Some(txt_meta) = mdns_txt_meta.get(ip) {
-                                if let Ok(mut meta) = meta_clone.lock() {
-                                    let entry = meta.entry(*ip).or_insert_with(HashMap::new);
-                                    for (k, v) in txt_meta {
-                                        entry.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+
+    // Merge passive packet-sniffer discoveries from perform_scan parameter
+    for r in passive_discovery.iter() {
+        let (ip, entry) = r.pair();
+        if !crate::display::is_local_ip(ip) { continue; }
+        if !new_map.contains_key(ip) {
+            new_map.insert(*ip, entry.clone());
+        }
+    }
+
+    // Age devices not seen in this scan
+    for mut r in active_discovery.iter_mut() {
+        let ip = *r.key();
+        let entry = r.value_mut();
+        if !new_map.contains_key(&ip) {
+            entry.miss_count = entry.miss_count.saturating_add(1);
+        }
+    }
+
+    // Merge found devices: update changed properties, preserve resolved hostname
+    for (ip, new_entry) in &new_map {
+        active_discovery.entry(*ip)
+            .and_modify(|existing| {
+                if new_entry.hostname != "Resolving..." && new_entry.hostname != "\u{2014}" {
+                    existing.hostname = new_entry.hostname.clone();
+                }
+                existing.mac = new_entry.mac.clone();
+                existing.vendor = new_entry.vendor.clone();
+                existing.miss_count = 0;
+                existing.last_seen = std::time::Instant::now();
+                existing.last_seen_unix = default_unix_now();
+            })
+            .or_insert(new_entry.clone());
+    }
+    let found = active_discovery.len();
+    let _ = status_tx.send(format!("Ready ({} discovered)", found));
+
+    // Run hostname resolution in background thread
+    let devices_clone = Arc::clone(active_discovery);
+    let mut snapshot_clone = snapshot.clone();
+    let network_name_clone = network_name.to_string();
+
+    // Retry hostname resolution for cached devices still showing "—" or "Resolving..."
+    for r in active_discovery.iter() {
+        let (ip, dev) = r.pair();
+        if (dev.hostname == "—" || dev.hostname == "Resolving...") && should_resolve_hostname(ip) {
+            if !snapshot_clone.contains(ip) {
+                snapshot_clone.push(*ip);
+            }
+        }
+    }
+
+    let meta_clone = Arc::clone(device_metadata);
+    let cancel_clone = Arc::clone(&cancel_flag);
+
+    let passive_hosts_thread = Arc::clone(&passive_hosts);
+    let passive_meta_thread = Arc::clone(&passive_meta);
+    let alert_tx_clone = alert_tx.clone();
+    let status_tx_clone = status_tx.clone();
+
+    let bg_handle = thread::spawn(move || {
+        if cancel_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            mdns_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = mdns_listener_handle.join();
+            return;
+        }
+
+        // Step 1: Run mDNS service browsing (8s scan)
+        let (mdns_hostnames, mdns_txt_meta) = collect_mdns_hostnames(&snapshot_clone, 8);
+        let mdns_clone = Arc::new(mdns_hostnames);
+
+        // Insert mDNS-discovered devices that were missed by ARP/ping sweep
+        {
+            let mut mdns_only_ips = Vec::new();
+            for (ip, mdns_name) in mdns_clone.iter() {
+                if !crate::display::is_local_ip(ip) { continue; }
+                let mut inserted = false;
+                devices_clone.entry(*ip).or_insert_with(|| {
+                    inserted = true;
+                    DeviceInfo {
+                        mac: "Unknown".to_string(),
+                        vendor: "Unknown".to_string(),
+                        hostname: mdns_name.clone(),
+                        miss_count: 0,
+                        last_seen: std::time::Instant::now(),
+                        last_seen_unix: default_unix_now(),
+                    }
+                });
+                if inserted {
+                    mdns_only_ips.push(*ip);
+                }
+            }
+            if !mdns_only_ips.is_empty() {
+                for ip in &mdns_only_ips {
+                    if let Some(txt_meta) = mdns_txt_meta.get(ip) {
+                        let mut entry = meta_clone.entry(*ip).or_insert_with(DeviceDetails::default);
+                        for (k, v) in &txt_meta.properties {
+                            entry.properties.insert(k.clone(), v.clone());
+                        }
+                        for svc in &txt_meta.services {
+                            entry.services.insert(svc.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Store mDNS TXT metadata into shared device_metadata store
+        if !mdns_txt_meta.is_empty() {
+            for (ip, txt_meta) in mdns_txt_meta {
+                if !crate::display::is_local_ip(&ip) { continue; }
+                let mut entry = meta_clone.entry(ip).or_insert_with(DeviceDetails::default);
+                for (k, v) in txt_meta.properties {
+                    entry.properties.insert(k, v);
+                }
+                for svc in txt_meta.services {
+                    entry.services.insert(svc);
+                }
+            }
+        }
+
+        if cancel_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            mdns_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = mdns_listener_handle.join();
+            return;
+        }
+
+        // Step 2: Run one batched PowerShell DNS lookup for all IPv4 IPs (single process,
+        // not one per IP). Results are shared into per-IP threads via Arc.
+        #[cfg(windows)]
+        let ps_results = {
+            let ipv4_ips: Vec<IpAddr> = snapshot_clone.iter()
+                .filter(|ip| ip.is_ipv4())
+                .copied()
+                .collect();
+            Arc::new(resolve_powershell_dns_batch(&ipv4_ips))
+        };
+
+        // Step 2: Per-IP fallback threads for standard DNS and NetBIOS
+        let handles: Vec<(IpAddr, mpsc::Receiver<_>)> = snapshot_clone.iter().map(|&ip| {
+            let (tx, rx) = mpsc::channel();
+            let mdns_ref = Arc::clone(&mdns_clone);
+            let dev_ref = Arc::clone(&devices_clone);
+            #[cfg(windows)]
+            let ps_ref = Arc::clone(&ps_results);
+
+            thread::spawn(move || {
+                let is_link_local_v6 = match ip {
+                    IpAddr::V6(v6) => v6.segments()[0] == 0xfe80,
+                    _ => false,
+                };
+
+                let result = if is_link_local_v6 {
+                    let mdns_res = mdns_ref.get(&ip).cloned();
+                    if mdns_res.is_some() {
+                        mdns_res
+                    } else {
+                        // Look up MAC address for this fe80:: IP from active_discovery (dev_ref)
+                        let mac_opt = dev_ref.get(&ip).map(|r| r.mac.clone());
+                        let mut resolved_from_mac = None;
+                        if let Some(mac) = mac_opt {
+                            if mac != "Unknown" && !mac.is_empty() {
+                                // Iterate and find an IPv4 counterpart with the same MAC and a resolved name
+                                for r in dev_ref.iter() {
+                                    let (other_ip, other_dev) = r.pair();
+                                    if other_ip.is_ipv4() && other_dev.mac == mac {
+                                        let name = &other_dev.hostname;
+                                        if name != "Resolving..." && name != "—" && name != "\u{2014}" && !name.is_empty() {
+                                            resolved_from_mac = Some(name.clone());
+                                            break;
+                                        }
                                     }
                                 }
                             }
                         }
+                        resolved_from_mac
                     }
-                }
-
-                // Store mDNS TXT metadata into the shared device_metadata store
-                if !mdns_txt_meta.is_empty() {
-                    if let Ok(mut meta) = meta_clone.lock() {
-                        for (ip, txt_meta) in mdns_txt_meta {
-                            let entry = meta.entry(ip).or_insert_with(HashMap::new);
-                            for (k, v) in txt_meta {
-                                entry.insert(k, v);
-                            }
-                        }
-                    }
-                }
-
-                // Step 2: Per-IP fallback threads for standard DNS and NetBIOS
-                let handles: Vec<(IpAddr, mpsc::Receiver<_>)> = snapshot_clone.iter().map(|&ip| {
-                    let (tx, rx) = mpsc::channel();
-                    let mdns_ref = Arc::clone(&mdns_clone);
-
-                    thread::spawn(move || {
-                        // Resolution chain: mDNS → NetBIOS → PowerShell DNS → System reverse DNS
-                        #[cfg(windows)]
-                        let result = mdns_ref.get(&ip)
+                } else {
+                    #[cfg(windows)]
+                    {
+                        // mDNS result → batched PS DNS (already resolved, instant) → NetBIOS.
+                        // lookup_addr is omitted: it has no timeout guarantee on Windows and
+                        // leaks threads when the system resolver stalls.
+                        mdns_ref.get(&ip)
                             .cloned()
+                            .or_else(|| ps_ref.get(&ip).cloned())
                             .or_else(|| resolve_netbios_name(&ip))
-                            .or_else(|| resolve_powershell_dns(&ip))
-                            .or_else(|| lookup_addr(&ip).ok());
-
-                        #[cfg(not(windows))]
-                        let result = mdns_ref.get(&ip)
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        mdns_ref.get(&ip)
                             .cloned()
-                            .or_else(|| lookup_addr(&ip).ok());
+                            .or_else(|| lookup_addr(&ip).ok())
+                    }
+                };
 
-                        let _ = tx.send(result);
-                    });
-                    (ip, rx)
-                }).collect();
+                let _ = tx.send(result);
+            });
+            (ip, rx)
+        }).collect();
 
-                // Drain results with timeout
-                for (ip, rx) in handles {
-                    let hostname = match rx.recv_timeout(Duration::from_secs(15)) {
-                        Ok(Some(name)) => {
-                            let name_str = name.trim().to_string();
-                            if name_str.is_empty() || name_str == ip.to_string() {
-                                None // Could not resolve — don't overwrite existing hostname
-                            } else {
-                                Some(name_str)
+        // Step 2: Partition handles into fe80_handles (link-local IPv6) and remaining handles (IPv4/other)
+        let (fe80_handles, ipv4_handles): (Vec<_>, Vec<_>) = handles.into_iter().partition(|(ip, _)| {
+            match ip {
+                IpAddr::V6(v6) => v6.segments()[0] == 0xfe80,
+                _ => false,
+            }
+        });
+
+        // Drain fe80_handles first with 200ms timeout
+        for (ip, rx) in fe80_handles {
+            let hostname = match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(Some(name)) => {
+                    let name_str = name.trim().to_string();
+                    if name_str.is_empty() || name_str == ip.to_string() {
+                        None
+                    } else {
+                        Some(name_str)
+                    }
+                }
+                Ok(None) | Err(_) => None,
+            };
+
+            if let Some(resolved_name) = hostname {
+                if let Some(mut entry) = devices_clone.get_mut(&ip) {
+                    if entry.hostname == "Resolving..." || entry.hostname == "\u{2014}" || entry.hostname.is_empty() {
+                        entry.hostname = resolved_name;
+                    }
+                }
+            } else {
+                if let Some(mut entry) = devices_clone.get_mut(&ip) {
+                    if entry.hostname == "Resolving..." {
+                        entry.hostname = "\u{2014}".to_string();
+                    }
+                }
+            }
+        }
+
+        // Drain remaining handles with 15s timeout
+        for (ip, rx) in ipv4_handles {
+            let hostname = match rx.recv_timeout(Duration::from_secs(15)) {
+                Ok(Some(name)) => {
+                    let name_str = name.trim().to_string();
+                    if name_str.is_empty() || name_str == ip.to_string() {
+                        None
+                    } else {
+                        Some(name_str)
+                    }
+                }
+                Ok(None) | Err(_) => None,
+            };
+
+            if let Some(resolved_name) = hostname {
+                let mut mac_to_update = None;
+                if let Some(mut entry) = devices_clone.get_mut(&ip) {
+                    if entry.hostname == "Resolving..." || entry.hostname == "\u{2014}" || entry.hostname.is_empty() {
+                        entry.hostname = resolved_name.clone();
+                        mac_to_update = Some(entry.mac.clone());
+                    }
+                }
+
+                // Inline cross-MAC fe80 update: update counterpart instantly as each IPv4 resolves
+                if let Some(mac) = mac_to_update {
+                    if mac != "Unknown" && !mac.is_empty() {
+                        let mut fe80_ips = Vec::new();
+                        for r in devices_clone.iter() {
+                            let (other_ip, other_dev) = r.pair();
+                            let is_fe80 = match other_ip {
+                                IpAddr::V6(v6) => v6.segments()[0] == 0xfe80,
+                                _ => false,
+                            };
+                            if is_fe80 && other_dev.mac == mac {
+                                let name = &other_dev.hostname;
+                                if name == "Resolving..." || name == "—" || name == "\u{2014}" || name.is_empty() {
+                                    fe80_ips.push(*other_ip);
+                                }
                             }
                         }
-                        Ok(None) | Err(_) => None, // Resolution failed — preserve existing
-                    };
+                        for fe80_ip in fe80_ips {
+                            if let Some(mut fe80_entry) = devices_clone.get_mut(&fe80_ip) {
+                                fe80_entry.hostname = resolved_name.clone();
+                            }
+                        }
+                    }
+                }
+            } else {
+                if let Some(mut entry) = devices_clone.get_mut(&ip) {
+                    if entry.hostname == "Resolving..." {
+                        entry.hostname = "\u{2014}".to_string();
+                    }
+                }
+            }
+        }
 
-                    // Only update hostname if we actually resolved a name.
-                    // NEVER clear an existing hostname or touch last_seen here —
-                    // that would reset the aging timer and mess up the display.
-                    if let Some(resolved_name) = hostname {
-                        if let Ok(mut map) = devices_clone.lock() {
-                            if let Some(entry) = map.get_mut(&ip) {
-                                // Only upgrade: don't overwrite a good name with a worse one
-                                if entry.hostname == "Resolving..." || entry.hostname == "\u{2014}" || entry.hostname.is_empty() {
-                                    entry.hostname = resolved_name;
-                                }
+        if cancel_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            mdns_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = mdns_listener_handle.join();
+            return;
+        }
+
+        // Step 3: SSDP/UPnP device enumeration (smart TVs, Roku, Sonos, routers)
+        let ssdp_results = ssdp_discover(3);
+        if !ssdp_results.is_empty() {
+            for (ip, ssdp_meta) in ssdp_results {
+                if !crate::display::is_local_ip(&ip) { continue; }
+                let mut entry = meta_clone.entry(ip).or_insert_with(DeviceDetails::default);
+                for (k, v) in ssdp_meta {
+                    if k == "services" {
+                        for s in v.split(',') {
+                            let clean_s = s.trim();
+                            if !clean_s.is_empty() {
+                                entry.services.insert(clean_s.to_string());
                             }
                         }
                     } else {
-                        // Resolution failed — if still "Resolving...", set to "—"
-                        // so the UI doesn't show a perpetual "Resolving..." state
-                        if let Ok(mut map) = devices_clone.lock() {
-                            if let Some(entry) = map.get_mut(&ip) {
-                                if entry.hostname == "Resolving..." {
-                                    entry.hostname = "\u{2014}".to_string();
-                                }
+                        entry.properties.insert(k, v);
+                    }
+                }
+            }
+        }
+
+        if cancel_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            mdns_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = mdns_listener_handle.join();
+            return;
+        }
+
+        // Step 4: WSD probe for Windows devices (printers, PCs, NAS)
+        let wsd_results = wsd_discover(3);
+        if !wsd_results.is_empty() {
+            for (ip, wsd_meta) in &wsd_results {
+                if !crate::display::is_local_ip(ip) { continue; }
+                let mut entry = meta_clone.entry(*ip).or_insert_with(DeviceDetails::default);
+                for (k, v) in wsd_meta {
+                    if k == "services" {
+                        for s in v.split(',') {
+                            let clean_s = s.trim();
+                            if !clean_s.is_empty() {
+                                entry.services.insert(clean_s.to_string());
                             }
+                        }
+                    } else {
+                        entry.properties.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            for (ip, wsd_meta) in wsd_results {
+                if !crate::display::is_local_ip(&ip) { continue; }
+                if let Some(hostname) = wsd_meta.get("wsd_hostname") {
+                    if let Some(mut entry) = devices_clone.get_mut(&ip) {
+                        if entry.hostname == "\u{2014}" || entry.hostname == "Resolving..." {
+                            entry.hostname = hostname.clone();
                         }
                     }
                 }
+            }
+        }
 
-                // Save baseline — strip fe80:: duplicates only from the SAVED copy,
-                // NOT from the live active_discovery map (removing from live map caused
-                // devices to vanish from the UI).
-                if let Ok(map) = devices_clone.lock() {
-                    let mut baseline_copy = map.clone();
-                    let ipv4_macs: std::collections::HashSet<String> = baseline_copy.iter()
-                        .filter(|(ip, _)| matches!(ip, IpAddr::V4(_)))
-                        .map(|(_, dev)| dev.mac.clone())
-                        .collect();
-                    let dupes: Vec<IpAddr> = baseline_copy.iter()
-                        .filter(|(ip, dev)| {
-                            if let IpAddr::V6(v6) = ip {
-                                v6.segments()[0] == 0xfe80 && ipv4_macs.contains(&dev.mac)
-                            } else {
-                                false
-                            }
-                        })
-                        .map(|(ip, _)| *ip)
-                        .collect();
-                    for ip in &dupes {
-                        baseline_copy.remove(ip);
-                    }
-                    save_baseline(&network_name_clone, &baseline_copy);
-                }
+        if cancel_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            mdns_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = mdns_listener_handle.join();
+            return;
+        }
 
-                // Step 3: SSDP/UPnP device enumeration (smart TVs, Roku, Sonos, routers)
-                let ssdp_results = ssdp_discover(3);
-                if !ssdp_results.is_empty() {
-                    if let Ok(mut meta) = meta_clone.lock() {
-                        for (ip, ssdp_meta) in ssdp_results {
-                            let entry = meta.entry(ip).or_insert_with(HashMap::new);
-                            for (k, v) in ssdp_meta {
-                                entry.insert(k, v);
-                            }
-                        }
+        // Step 4.5: Active DHCP Inform Probing for unidentified devices
+        {
+            let mut unident_ips = Vec::new();
+            for r in devices_clone.iter() {
+                let (ip, dev) = r.pair();
+                if let IpAddr::V4(v4) = ip {
+                    let has_model = meta_clone.get(ip).map_or(false, |m| m.properties.contains_key("model"));
+                    let is_apple = dev.vendor == "Apple, Inc." || dev.vendor == "Apple Inc." || dev.vendor == "Apple" || dev.vendor == "Apple Device";
+                    if !has_model && (dev.vendor == "Unknown" || dev.vendor == "Randomized MAC" || is_apple) {
+                        unident_ips.push(*v4);
                     }
                 }
+            }
 
-                // Step 4: WSD probe for Windows devices (printers, PCs, NAS)
-                let wsd_results = wsd_discover(3);
-                if !wsd_results.is_empty() {
-                    if let Ok(mut meta) = meta_clone.lock() {
-                        for (ip, wsd_meta) in &wsd_results {
-                            let entry = meta.entry(*ip).or_insert_with(HashMap::new);
-                            for (k, v) in wsd_meta {
-                                entry.insert(k.clone(), v.clone());
-                            }
-                        }
-                    }
-                    // Also update hostnames from WSD if we got one
-                    for (ip, wsd_meta) in wsd_results {
-                        if let Some(hostname) = wsd_meta.get("wsd_hostname") {
-                            if let Ok(mut map) = devices_clone.lock() {
-                                if let Some(entry) = map.get_mut(&ip) {
-                                    if entry.hostname == "\u{2014}" || entry.hostname == "Resolving..." {
-                                        entry.hostname = hostname.clone();
-                                    }
-                                }
-                            }
-                        }
+            if !unident_ips.is_empty() {
+                let dhcp_fps = crate::dhcp_probe::probe_dhcp_fingerprints(
+                    &unident_ips,
+                    interface_v4,
+                    interface_mac,
+                    1500
+                );
+                
+                if !dhcp_fps.is_empty() {
+                    for (ip, fp) in dhcp_fps {
+                        let mut entry = meta_clone.entry(ip).or_insert_with(DeviceDetails::default);
+                        entry.properties.insert("dhcp_fingerprint".to_string(), fp);
                     }
                 }
+            }
+        }
 
-                // Step 4.5: Active DHCP Inform Probing for unidentified devices
-                // Any device found via ARP but missing OS identification gets a DHCP Inform packet
-                // to solicit its Option 55 Parameter Request List without negotiating a lease.
-                {
-                    let mut unident_ips = Vec::new();
-                    if let Ok(map) = devices_clone.lock() {
-                        let meta_guard = meta_clone.lock().unwrap();
-                        for (ip, dev) in map.iter() {
-                            if let IpAddr::V4(v4) = ip {
-                                // Only probe if we don't already have a strong OS model/fingerprint
-                                let has_model = meta_guard.get(ip).map_or(false, |m| m.contains_key("model"));
-                                let is_apple = dev.vendor == "Apple Inc." || dev.vendor == "Apple";
-                                // If it's completely unknown, or we know it's Apple but don't know WHICH Apple device
-                                if !has_model && (dev.vendor == "Unknown" || dev.vendor == "Randomized MAC" || is_apple) {
-                                    unident_ips.push(*v4);
-                                }
-                            }
-                        }
-                    }
+        if cancel_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            mdns_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = mdns_listener_handle.join();
+            return;
+        }
 
-                    if !unident_ips.is_empty() {
-                        let dhcp_fps = crate::dhcp_probe::probe_dhcp_fingerprints(
-                            &unident_ips,
-                            interface_v4,
-                            interface_mac,
-                            1500
-                        );
-                        
-                        if !dhcp_fps.is_empty() {
-                            if let Ok(mut meta) = meta_clone.lock() {
-                                for (ip, fp) in dhcp_fps {
-                                    let entry = meta.entry(ip).or_insert_with(HashMap::new);
-                                    entry.insert("dhcp_fingerprint".to_string(), fp);
-                                }
-                            }
-                        }
-                    }
-                }
+        // Step 4.8: HTTP banner scan — extracts friendly names from web interfaces
+        {
+            let scan_ips: Vec<IpAddr> = devices_clone.iter()
+                .map(|r| *r.key())
+                .filter(|ip| crate::display::is_local_ip(ip))
+                .collect();
+            http_banner_scan(&scan_ips, &meta_clone, &devices_clone, &status_tx_clone);
+        }
 
-                // Step 5: Final Enrichment - replace technical junk with friendly names
-                if let Ok(mut map) = devices_clone.lock() {
-                    if let Ok(meta) = meta_clone.lock() {
-                        for (ip, entry) in map.iter_mut() {
-                            // If name is cryptic (starts with _, or is a placeholder) try to upgrade it from metadata
-                            if entry.hostname.starts_with('_') || entry.hostname == "\u{2014}" || entry.hostname == "Resolving..." {
-                                if let Some(dev_meta) = meta.get(ip) {
-                                    if let Some(model) = dev_meta.get("model")
-                                        .or(dev_meta.get("friendly_name"))
-                                        .or(dev_meta.get("model_name")) 
-                                    {
-                                        entry.hostname = model.clone();
-                                    }
-                                }
-                            }
-                            
-                            // General cleanup for common cryptic network artifacts
-                            let mut clean_name = entry.hostname.trim_start_matches('_').to_string();
-                            if let Some(pos) = clean_name.find("._") {
-                                clean_name.truncate(pos);
-                            }
-                            if clean_name.starts_with("I49B8F") { clean_name = "eero Node".to_string(); }
-                            if clean_name == "eerogw" { clean_name = "eero Gateway".to_string(); }
-                            if clean_name == "trel" { clean_name = "eero Link".to_string(); }
-                            if clean_name == "asquic" {
-                                // Context-aware: use model from metadata if available
-                                if let Some(dev_meta) = meta.get(ip) {
-                                    if let Some(model) = dev_meta.get("model") {
-                                        if model.starts_with("iPhone") || model.starts_with("iPad") {
-                                            clean_name = model.clone();
-                                        } else {
-                                            clean_name = "Apple Device".to_string();
-                                        }
-                                    } else {
-                                        clean_name = "Apple Device".to_string();
-                                    }
-                                } else {
-                                    clean_name = "Apple Device".to_string();
-                                }
-                            }
-                            if clean_name != entry.hostname {
-                                entry.hostname = clean_name;
-                            }
-                        }
+        if cancel_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            mdns_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = mdns_listener_handle.join();
+            return;
+        }
+
+        // Step 5: Final Enrichment - replace technical junk with friendly names
+        for mut r in devices_clone.iter_mut() {
+            let ip = *r.key();
+            let entry = r.value_mut();
+            
+            if entry.hostname.starts_with('_') || entry.hostname == "\u{2014}" || entry.hostname == "Resolving..." {
+                if let Some(dev_meta) = meta_clone.get(&ip) {
+                    if let Some(model) = dev_meta.get("model")
+                        .or(dev_meta.get("friendly_name"))
+                        .or(dev_meta.get("model_name")) 
+                    {
+                        entry.hostname = model.clone();
                     }
                 }
-
-                // Final save of baseline with enriched names
-                if let Ok(map) = devices_clone.lock() {
-                    let mut baseline_copy = map.clone();
-                    // Strip fe80:: dupes from saved baseline only
-                    let ipv4_macs: std::collections::HashSet<String> = baseline_copy.iter()
-                        .filter(|(ip, _)| matches!(ip, IpAddr::V4(_)))
-                        .map(|(_, dev)| dev.mac.clone())
-                        .collect();
-                    baseline_copy.retain(|ip, dev| {
-                        if let IpAddr::V6(v6) = ip {
-                            !(v6.segments()[0] == 0xfe80 && ipv4_macs.contains(&dev.mac))
+            }
+            
+            let mut clean_name = entry.hostname.trim_start_matches('_').to_string();
+            if let Some(pos) = clean_name.find("._") {
+                clean_name.truncate(pos);
+            }
+            if clean_name.starts_with("I49B8F") { clean_name = "eero Node".to_string(); }
+            if clean_name == "eerogw" { clean_name = "eero Gateway".to_string(); }
+            if clean_name == "trel" { clean_name = "eero Link".to_string(); }
+            if clean_name == "asquic" {
+                if let Some(dev_meta) = meta_clone.get(&ip) {
+                    if let Some(model) = dev_meta.get("model") {
+                        if model.starts_with("iPhone") || model.starts_with("iPad") {
+                            clean_name = model.clone();
                         } else {
-                            true
+                            clean_name = "Apple Device".to_string();
                         }
-                    });
-                    save_baseline(&network_name_clone, &baseline_copy);
+                    } else {
+                        clean_name = "Apple Device".to_string();
+                    }
+                } else {
+                    clean_name = "Apple Device".to_string();
+                }
+            }
+            if clean_name != entry.hostname {
+                entry.hostname = clean_name;
+            }
+
+            if entry.vendor == "Unknown" || entry.vendor == "Randomized MAC" || entry.vendor == "Apple Device" {
+                if let Some(dev_meta) = meta_clone.get(&ip) {
+                    if let Some(mfr) = dev_meta.get("manufacturer") {
+                        if !mfr.is_empty() && mfr != "—" {
+                            entry.vendor = mfr.clone();
+                        }
+                    }
+                }
+            }
+
+            let mut is_apple = false;
+            let host_lower = entry.hostname.to_lowercase();
+            if host_lower.contains("iphone")
+                || host_lower.contains("ipad")
+                || host_lower.contains("macbook")
+                || host_lower.contains("imac")
+                || host_lower.contains("apple tv")
+                || host_lower.contains("appletv")
+                || host_lower.contains("homepod")
+                || host_lower.contains("apple watch")
+                || host_lower.contains("applewatch")
+            {
+                is_apple = true;
+            }
+
+            if let Some(dev_meta) = meta_clone.get(&ip) {
+                if let Some(model) = dev_meta.get("model") {
+                    let model_lower = model.to_lowercase();
+                    if model_lower.contains("iphone")
+                        || model_lower.contains("ipad")
+                        || model_lower.contains("macbook")
+                        || model_lower.contains("imac")
+                        || model_lower.contains("apple tv")
+                        || model_lower.contains("appletv")
+                        || model_lower.contains("homepod")
+                        || model_lower.contains("apple watch")
+                        || model_lower.contains("applewatch")
+                        || model_lower.starts_with("apple")
+                    {
+                        is_apple = true;
+                    }
+                }
+                for s in &dev_meta.services {
+                    let s_lower = s.to_lowercase();
+                    if s_lower.contains("airplay")
+                        || s_lower.contains("apple companion")
+                        || s_lower.contains("apple accessory")
+                        || s_lower.contains("asquic")
+                    {
+                        is_apple = true;
+                        break;
+                    }
+                }
+            }
+
+            // Only stamp Apple when vendor is still unresolved — prevents overwriting
+            // real vendors like "Sonos, Inc." that legitimately expose AirPlay.
+            if is_apple && (entry.vendor == "Unknown" || entry.vendor == "Randomized MAC") {
+                entry.vendor = "Apple, Inc.".to_string();
+            }
+
+            // Classify device category — drop the read ref BEFORE acquiring write access
+            // to avoid a DashMap shard deadlock (read + write on same shard, same thread).
+            let cat = {
+                let meta_ref = meta_clone.get(&ip);
+                classify_device_category(&entry.vendor, &entry.hostname, meta_ref.as_deref())
+            };
+            if let Some(cat) = cat {
+                let mut meta_entry = meta_clone.entry(ip).or_insert_with(DeviceDetails::default);
+                meta_entry.properties.entry("category".to_string()).or_insert_with(|| cat.to_string());
+            }
+        }
+
+        // Final Stage: Stop the passive listener and merge final results (Fix 3, Part 1)
+        mdns_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = mdns_listener_handle.join();
+
+        // Merge all accumulated passive hosts into active_discovery
+        for r in passive_hosts_thread.iter() {
+            let ip = *r.key();
+            if !crate::display::is_local_ip(&ip) { continue; }
+            let hostname = r.value().clone();
+            devices_clone.entry(ip).and_modify(|entry| {
+                if entry.hostname == "Resolving..." || entry.hostname == "\u{2014}" || entry.hostname.is_empty() {
+                    entry.hostname = hostname.clone();
+                }
+            }).or_insert_with(|| DeviceInfo {
+                mac: "Unknown".to_string(),
+                vendor: "Unknown".to_string(),
+                hostname,
+                miss_count: 0,
+                last_seen: std::time::Instant::now(),
+                last_seen_unix: default_unix_now(),
+            });
+        }
+        
+        // Merge all accumulated passive metadata into device_metadata
+        for r in passive_meta_thread.iter() {
+            let ip = *r.key();
+            if !crate::display::is_local_ip(&ip) { continue; }
+            let txt_meta = r.value();
+            let mut entry = meta_clone.entry(ip).or_insert_with(DeviceDetails::default);
+            for (k, v) in &txt_meta.properties {
+                entry.properties.insert(k.clone(), v.clone());
+            }
+            for svc in &txt_meta.services {
+                entry.services.insert(svc.clone());
+            }
+        }
+
+        // Stage 7: Duplicate MAC address and Espressif/hardware batch pairing checks
+        {
+            // 1. Group devices by MAC address
+            let mut mac_to_ips: HashMap<String, Vec<IpAddr>> = HashMap::new();
+            let mut devices_list: Vec<(IpAddr, String, String, String)> = Vec::new();
+            
+            for r in devices_clone.iter() {
+                let (ip, dev) = r.pair();
+                if dev.mac != "Unknown" && !dev.mac.is_empty() {
+                    mac_to_ips.entry(dev.mac.clone()).or_insert_with(Vec::new).push(*ip);
+                    devices_list.push((*ip, dev.mac.clone(), dev.vendor.clone(), dev.hostname.clone()));
+                }
+            }
+
+            // Sonos & Multi-room duplicate MAC check
+            for (mac, ips) in mac_to_ips {
+                if ips.len() > 1 {
+                    // Suppress same-device fe80 + IPv4 duplicate MAC warnings
+                    let is_fe80_ipv4_pair = if ips.len() == 2 {
+                        let is_link_local = |ip: &IpAddr| match ip {
+                            IpAddr::V6(v6) => v6.segments()[0] == 0xfe80,
+                            _ => false,
+                        };
+                        (is_link_local(&ips[0]) && ips[1].is_ipv4()) || (is_link_local(&ips[1]) && ips[0].is_ipv4())
+                    } else {
+                        false
+                    };
+
+                    if is_fe80_ipv4_pair {
+                        continue;
+                    }
+
+                    let vendor = crate::oui::get_vendor(&mac);
+                    let vendor_lower = vendor.to_lowercase();
+                    let known_multiroom_audio = [
+                        "sonos", "bose", "denon", "yamaha", "bang & olufsen", "bang and olufsen"
+                    ];
+                    let is_multiroom = known_multiroom_audio.iter().any(|&m| vendor_lower.contains(m));
+
+                    if is_multiroom {
+                        let msg = format!("Sonos group MAC shared across {} speakers — expected behavior. (MAC: {}, IPs: {:?})", ips.len(), mac, ips);
+                        let _ = alert_tx_clone.send(msg);
+                    } else {
+                        let msg = format!("Duplicate MAC address detected! MAC: {} shared by {} IPs: {:?}", mac, ips.len(), ips);
+                        let _ = alert_tx_clone.send(msg);
+                    }
+                }
+            }
+
+            // Sequential MAC hardware batch pairing heuristic
+            for i in 0..devices_list.len() {
+                for j in (i + 1)..devices_list.len() {
+                    let (ip1, mac1, vendor1, host1) = &devices_list[i];
+                    let (ip2, mac2, vendor2, host2) = &devices_list[j];
+
+                    let clean1 = mac1.replace(":", "").replace("-", "").to_uppercase();
+                    let clean2 = mac2.replace(":", "").replace("-", "").to_uppercase();
+
+                    if clean1.len() == 12 && clean2.len() == 12 {
+                        let oui1 = &clean1[..6];
+                        let oui2 = &clean2[..6];
+
+                        if oui1 == oui2 {
+                            if let (Ok(val1), Ok(val2)) = (u64::from_str_radix(&clean1, 16), u64::from_str_radix(&clean2, 16)) {
+                                let diff = if val1 > val2 { val1 - val2 } else { val2 - val1 };
+                                if diff <= 512 {
+                                    let mut note = "Device Pair — likely same hardware batch".to_string();
+                                    let is_espressif = vendor1.to_lowercase().contains("espressif") || vendor2.to_lowercase().contains("espressif");
+                                    if is_espressif {
+                                        let name1 = if host1 != "—" && host1 != "Resolving..." { host1.as_str() } else { "ESP32" };
+                                        let name2 = if host2 != "—" && host2 != "Resolving..." { host2.as_str() } else { "ESP32" };
+                                        note = format!("Device Pair — likely same hardware batch (ESP32 pair: {} & {})", name1, name2);
+                                    }
+
+                                    for ip in &[ip1, ip2] {
+                                        let mut entry = meta_clone.entry(**ip).or_insert_with(DeviceDetails::default);
+                                        entry.properties.insert("note".to_string(), note.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Final save of baseline with enriched names
+        {
+            let mut baseline_copy = HashMap::new();
+            for r in devices_clone.iter() {
+                let (ip, dev) = r.pair();
+                baseline_copy.insert(*ip, dev.clone());
+            }
+            let ipv4_macs: std::collections::HashSet<String> = baseline_copy.iter()
+                .filter(|(ip, _)| matches!(ip, IpAddr::V4(_)))
+                .map(|(_, dev)| dev.mac.clone())
+                .collect();
+            baseline_copy.retain(|ip, dev| {
+                if !crate::display::is_local_ip(ip) {
+                    return false;
+                }
+                if let IpAddr::V6(v6) = ip {
+                    !(v6.segments()[0] == 0xfe80 && ipv4_macs.contains(&dev.mac))
+                } else {
+                    true
                 }
             });
-        } else {
-            let _ = status_tx.send("Error: API failure".to_string());
+            save_baseline(&network_name_clone, &baseline_copy);
         }
-    }
+    });
+    bg_handle
 }
 
 #[cfg(not(windows))]
-fn perform_scan(_: &Arc<Mutex<HashMap<IpAddr, (String, String, String)>>>, _: &Arc<Mutex<DeviceMetadata>>, _: &str, _: &str, status_tx: &mpsc::Sender<String>, _: &mpsc::Sender<String>) {
+fn perform_scan(
+    _passive_discovery: &Arc<DashMap<IpAddr, DeviceInfo>>,
+    _active_discovery: &Arc<DashMap<IpAddr, DeviceInfo>>,
+    _device_metadata: &Arc<DashMap<IpAddr, DeviceDetails>>,
+    _: &str,
+    _: &str,
+    status_tx: &mpsc::Sender<String>,
+    _: &mpsc::Sender<String>,
+    _cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+) -> thread::JoinHandle<()> {
     let _ = status_tx.send("Discovery not supported".to_string());
+    thread::spawn(|| {})
 }

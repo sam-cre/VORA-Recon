@@ -44810,8 +44810,8 @@ CCBABD     (base 16)		TP-Link Systems Inc.
 				 Irvine  CA  92618
 				US
 
-5C-E7-53   (hex)		Private
-5CE753     (base 16)		Private
+5C-E7-53   (hex)		Google LLC
+5CE753     (base 16)		Google LLC
 
 B4-5B-86   (hex)		Funshion Online Technologies Co.,Ltd
 B45B86     (base 16)		Funshion Online Technologies Co.,Ltd
@@ -141404,8 +141404,8 @@ FCB2D6     (base 16)		CIG SHANGHAI CO LTD
 				Beijing    100094
 				CN
 
-60-74-F4   (hex)		Private
-6074F4     (base 16)		Private
+60-74-F4   (hex)		Google LLC
+6074F4     (base 16)		Google LLC
 
 A0-37-68   (hex)		Shenzhen E-Life Intelligence Technology Co.,Ltd.
 A03768     (base 16)		Shenzhen E-Life Intelligence Technology Co.,Ltd.

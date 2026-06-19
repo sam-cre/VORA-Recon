@@ -39,7 +39,7 @@ pub enum AlertTier {
     Noise,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum AlertReason {
     SuspiciousFlags,
     SensitivePort,
@@ -47,6 +47,8 @@ pub enum AlertReason {
     HighVolume,
     OutboundPublic,
     LocalBroadcast,
+    MdnsLeak,
+    DhcpLeak,
 }
 
 #[derive(Clone)]
@@ -257,6 +259,10 @@ pub struct AppState {
     // Per-IP traffic profiles for behavioral device classification
     pub traffic_profiles: HashMap<IpAddr, TrafficProfile>,
     pub external_alerted: HashSet<IpAddr>,
+    // Baseline IPs loaded from previous session — used to mark new devices with [NEW]
+    pub baseline_ips: HashSet<IpAddr>,
+    // True only after a real scan completes (not just baseline load) — gates [NEW] display
+    pub fresh_scan_done: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -404,6 +410,8 @@ impl AppState {
             dhcp_fingerprints: HashMap::new(),
             traffic_profiles: HashMap::new(),
             external_alerted: HashSet::new(),
+            baseline_ips: HashSet::new(),
+            fresh_scan_done: false,
         }
     }
 
@@ -861,8 +869,113 @@ fn is_noise_address(ip: &std::net::IpAddr) -> bool {
             return;
         }
 
+        // Dedicated Rule — mDNS Leak (Suspicious tier)
+        let mut is_mdns_leak = false;
+        if pkt.protocol == Protocol::Udp && pkt.dst_port == Some(5353) {
+            let is_public_dest = !is_local_or_multicast(&pkt.dst_ip) && match pkt.dst_ip {
+                IpAddr::V4(v4) => v4.octets()[0] != 169 || v4.octets()[1] != 254,
+                _ => true,
+            };
+
+            if is_public_dest {
+                is_mdns_leak = true;
+
+                let mut device_info = None;
+                if let Ok(active) = self.active_discovery.try_lock() {
+                    if let Some(dev) = active.get(&pkt.src_ip) {
+                        device_info = Some(dev.clone());
+                    }
+                }
+                if device_info.is_none() {
+                    if let Ok(passive) = self.passive_discovery.try_lock() {
+                        if let Some(dev) = passive.get(&pkt.src_ip) {
+                            device_info = Some(dev.clone());
+                        }
+                    }
+                }
+
+                let device_str = if let Some(dev) = device_info {
+                    format!("{} (MAC: {}, Vendor: {})", dev.hostname, dev.mac, dev.vendor)
+                } else {
+                    "Unknown Device (not in inventory)".to_string()
+                };
+
+                let proc_str = if proc_label != "--" && proc_label != "unknown" {
+                    format!(" (Process: {})", proc_label)
+                } else {
+                    "".to_string()
+                };
+
+                let message = format!(
+                    "mDNS Leak — LAN discovery protocol sent to public internet. Source: {} | Src IP: {} | Dst: {}:5353{}{}",
+                    device_str, pkt.src_ip, pkt.dst_ip, geo_tag, proc_str
+                );
+
+                self.push_alert(Alert {
+                    timestamp: now,
+                    message,
+                    level: AlertLevel::Warn,
+                    tier: AlertTier::Suspicious,
+                    remote_ip: Some(pkt.dst_ip),
+                    process: Some(proc_label.clone()),
+                    reason: AlertReason::MdnsLeak,
+                });
+            }
+        }
+
+        // Dedicated Rule — DHCP Leak (Suspicious tier)
+        let mut is_dhcp_leak = false;
+        if pkt.protocol == Protocol::Udp && pkt.dst_port == Some(67) {
+            let is_public_dest = !is_local_or_multicast(&pkt.dst_ip);
+
+            if is_public_dest {
+                is_dhcp_leak = true;
+
+                let mut device_info = None;
+                if let Ok(active) = self.active_discovery.try_lock() {
+                    if let Some(dev) = active.get(&pkt.src_ip) {
+                        device_info = Some(dev.clone());
+                    }
+                }
+                if device_info.is_none() {
+                    if let Ok(passive) = self.passive_discovery.try_lock() {
+                        if let Some(dev) = passive.get(&pkt.src_ip) {
+                            device_info = Some(dev.clone());
+                        }
+                    }
+                }
+
+                let device_str = if let Some(dev) = device_info {
+                    format!("{} (MAC: {}, Vendor: {})", dev.hostname, dev.mac, dev.vendor)
+                } else {
+                    "Unknown Device (not in inventory)".to_string()
+                };
+
+                let proc_str = if proc_label != "--" && proc_label != "unknown" {
+                    format!(" (Process: {})", proc_label)
+                } else {
+                    "".to_string()
+                };
+
+                let message = format!(
+                    "DHCP Request to Public IP — possible mesh node misconfiguration or rogue DHCP client. Source: {} | Src IP: {} | Dst: {}:67{}{}",
+                    device_str, pkt.src_ip, pkt.dst_ip, geo_tag, proc_str
+                );
+
+                self.push_alert(Alert {
+                    timestamp: now,
+                    message,
+                    level: AlertLevel::Warn,
+                    tier: AlertTier::Suspicious,
+                    remote_ip: Some(pkt.dst_ip),
+                    process: Some(proc_label.clone()),
+                    reason: AlertReason::DhcpLeak,
+                });
+            }
+        }
+
         // Rule 5 — Outbound public (External tier)
-        if !is_local_or_multicast(&pkt.dst_ip) && packet_count == 1 {
+        if !is_local_or_multicast(&pkt.dst_ip) && packet_count == 1 && !is_mdns_leak && !is_dhcp_leak {
             let port_str = pkt.dst_port.map_or("---".to_string(), |p| p.to_string());
 
             let trusted_orgs = [
@@ -896,7 +1009,7 @@ fn is_noise_address(ip: &std::net::IpAddr) -> bool {
         let discovery_ports = [1900, 3702, 5353, 5355, 67, 68, 137, 138, 139];
         let is_discovery_port = pkt.dst_port.map_or(false, |p| discovery_ports.contains(&p)) || pkt.src_port.map_or(false, |p| discovery_ports.contains(&p));
 
-        if (is_broadcast_ip || is_discovery_port) && packet_count == 1 {
+        if (is_broadcast_ip || is_discovery_port) && packet_count == 1 && !is_mdns_leak && !is_dhcp_leak {
             let port_str = pkt.dst_port.map_or("---".to_string(), |p| p.to_string());
             self.push_alert(Alert {
                 timestamp: now,
@@ -1534,7 +1647,10 @@ pub fn is_local_ip(ip: &IpAddr) -> bool {
                 [169, 254, ..]                      // 169.254.0.0/16 link-local
             ) && o != [0, 0, 0, 0]
         }
-        _ => false,
+        IpAddr::V6(v6) => {
+            let o = v6.octets();
+            o[0] == 0xfe && (o[1] & 0xc0) == 0x80 // fe80::/10 link-local
+        }
     }
 }
 
@@ -1779,7 +1895,7 @@ pub fn draw_ui(f: &mut Frame, state: &AppState) {
 
     let main_chunks = Layout::vertical([
         Constraint::Length(13),     // 0: Live Feed + Logo
-        Constraint::Length(11),     // 1: Connections + Alerts
+        Constraint::Length(12),     // 1: Connections + Alerts
         Constraint::Fill(1),        // 2: Bottom analysis row (Fills remaining space)
         Constraint::Length(1),      // 3: Footer line 1
         Constraint::Length(1),      // 4: Footer line 2
@@ -1950,7 +2066,7 @@ fn draw_connections(f: &mut Frame, area: Rect, state: &AppState) {
                 .unwrap_or(proc_name);
                 
             let proc_display = if proc_name == "unknown" && !is_private_ip(src) && is_private_ip(dst) {
-                "← inbound"
+                "<- inbound"
             } else {
                 proc_name
             };
@@ -2057,7 +2173,7 @@ fn draw_alerts(f: &mut Frame, area: Rect, state: &AppState) {
                 let (prefix, color) = match a.tier {
                     AlertTier::Suspicious => ("[!]", Color::Red),
                     AlertTier::Behavioral => ("[~]", Color::Yellow),
-                    AlertTier::External   => ("[→]", Color::Cyan),
+                    AlertTier::External   => ("[->]", Color::Cyan),
                     AlertTier::Noise      => ("[-]", Color::DarkGray),
                 };
 
@@ -2259,7 +2375,14 @@ pub fn clean_hostname(raw: &str) -> String {
         return "\u{2014}".to_string();
     }
 
-    h.trim().to_string()
+    strip_control_chars(h.trim())
+}
+
+/// Remove ASCII/Unicode control characters (ESC, DEL, C0/C1 range) from a string.
+/// Prevents malicious devices from injecting terminal escape sequences via their
+/// mDNS hostname, SSDP friendlyName, HTTP title, etc. into the TUI or report file.
+pub fn strip_control_chars(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
 }
 
 fn strip_duplicate_parens(s: &str) -> String {
@@ -2399,60 +2522,111 @@ fn draw_local_devices(f: &mut Frame, area: Rect, state: &AppState, prefix: &str)
 
         let ip_col_width = if state.ip_compressed { max_ip_len + 1 } else { 16 };
 
-        sorted.iter().enumerate().map(|(i, (ip, dev))| {
-            let last_seen_str = format_last_seen(dev);
-            let os_tag = state.get_resolved_os_tag(ip);
-            let is_stale = dev.miss_count > 0;
-            
-            let hostname = clean_hostname(&dev.hostname);
+        {
+            let mut result: Vec<ListItem> = Vec::new();
+            let mut prev_subnet: Option<[u8; 3]> = None;
 
-            // Resolve the best available display name via priority chain (Option A)
-            let display_hostname = if hostname != "\u{2014}" && hostname != "Resolving..." && !hostname.is_empty() {
-                // 1. Use discovery hostname if it's high quality
-                hostname
-            } else {
-                // 2. Try rich metadata (mDNS model, SSDP friendly name, etc.)
-                let metadata_name = if let Ok(meta) = state.device_metadata.try_lock() {
-                    meta.get(ip)
-                        .and_then(|m| m.get("model").or(m.get("friendly_name")).or(m.get("model_name")))
-                        .map(|m| clean_hostname(m))
+            for (i, (ip, dev)) in sorted.iter().enumerate() {
+                // Feature 5: subnet separator row when the /24 prefix changes
+                if let IpAddr::V4(v4) = ip {
+                    let oct = v4.octets();
+                    let subnet = [oct[0], oct[1], oct[2]];
+                    if prev_subnet != Some(subnet) {
+                        if prev_subnet.is_some() {
+                            // blank divider
+                            result.push(ListItem::new("").style(Style::default().fg(Color::DarkGray)));
+                        }
+                        let label = format!(" ── {}.{}.{}.0/24 ", oct[0], oct[1], oct[2]);
+                        result.push(
+                            ListItem::new(label).style(Style::default().fg(Color::DarkGray))
+                        );
+                        prev_subnet = Some(subnet);
+                    }
+                }
+
+                let last_seen_str = format_last_seen(dev);
+                let os_tag = state.get_resolved_os_tag(ip);
+                let is_stale = dev.miss_count > 0;
+
+                let hostname = clean_hostname(&dev.hostname);
+
+                // Resolve the best available display name via priority chain (Option A)
+                let display_hostname = if hostname != "\u{2014}" && hostname != "Resolving..." && !hostname.is_empty() {
+                    hostname
                 } else {
-                    None
-                };
-
-                if let Some(m) = metadata_name {
-                    if m != "\u{2014}" && !m.is_empty() {
-                        m
+                    let metadata_name = if let Ok(meta) = state.device_metadata.try_lock() {
+                        meta.get(ip)
+                            .and_then(|m| m.get("model").or(m.get("friendly_name")).or(m.get("model_name")))
+                            .map(|m| clean_hostname(m))
                     } else {
-                        // 3. Fallback to behavioral classification if metadata is also poor
+                        None
+                    };
+
+                    if let Some(m) = metadata_name {
+                        if m != "\u{2014}" && !m.is_empty() {
+                            m
+                        } else {
+                            state.traffic_profiles.get(ip)
+                                .and_then(|p| classify_device_type(p))
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| hostname.clone())
+                        }
+                    } else {
                         state.traffic_profiles.get(ip)
                             .and_then(|p| classify_device_type(p))
                             .map(|c| c.to_string())
                             .unwrap_or_else(|| hostname.clone())
                     }
+                };
+
+                // Feature 3: category tag — computed live from vendor+hostname, no lock needed.
+                let cat_tag = crate::discovery::classify_device_category(
+                    &dev.vendor,
+                    &display_hostname,
+                    None,
+                )
+                .map(|c| format!("[{}]", c))
+                .unwrap_or_default();
+
+                // Feature 4: [NEW] marker — only after a real scan completes.
+                // fe80 link-local addresses are ephemeral; skip them.
+                let is_link_local = matches!(ip, IpAddr::V6(v6) if v6.segments()[0] == 0xfe80);
+                let is_new = !is_link_local
+                    && state.fresh_scan_done
+                    && (state.baseline_ips.is_empty() || !state.baseline_ips.contains(*ip));
+
+                let name_field = if is_new {
+                    format!("[NEW] {}", display_hostname)
                 } else {
-                    // 3. Fallback to behavioral classification
-                    state.traffic_profiles.get(ip)
-                        .and_then(|p| classify_device_type(p))
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| hostname.clone())
-                }
-            };
+                    display_hostname
+                };
 
-            let row = format!(" {:<ip_width$} {:<5} {:<17}  {:<24} {:<10} {}", 
-                display_ips[i], 
-                os_tag, 
-                dev.mac, 
-                truncate_str(&display_hostname, 24), 
-                last_seen_str,
-                dev.vendor,
-                ip_width = ip_col_width
-            );
+                let row = format!(" {:<ip_width$} {:<5} {:<17}  {:<11} {:<24} {:<10} {}",
+                    display_ips[i],
+                    os_tag,
+                    dev.mac,
+                    truncate_str(&cat_tag, 11),
+                    truncate_str(&name_field, 24),
+                    last_seen_str,
+                    strip_control_chars(&dev.vendor),
+                    ip_width = ip_col_width
+                );
 
-            let color = if is_stale { Color::DarkGray } else { Color::White };
-            ListItem::new(truncate_str(&row, area.width.saturating_sub(2) as usize))
-                .style(Style::default().fg(color))
-        }).collect()
+                let color = if is_new {
+                    Color::Green
+                } else if is_stale {
+                    Color::DarkGray
+                } else {
+                    Color::White
+                };
+
+                result.push(
+                    ListItem::new(truncate_str(&row, area.width.saturating_sub(2) as usize))
+                        .style(Style::default().fg(color))
+                );
+            }
+            result
+        }
     };
 
     let visible_height = area.height.saturating_sub(2) as usize;
@@ -2475,7 +2649,7 @@ fn draw_local_devices(f: &mut Frame, area: Rect, state: &AppState, prefix: &str)
 
     if state.discovery_paused_scroll && !rendered_items.is_empty() {
         let last_idx = rendered_items.len() - 1;
-        rendered_items[last_idx] = ListItem::new("  \u{2193} Press [Space] to resume live scroll")
+        rendered_items[last_idx] = ListItem::new("  [PAUSED] Press [Space] to resume live scroll")
             .style(Style::default().fg(Color::Yellow));
     }
 
@@ -2578,7 +2752,7 @@ fn draw_footer(f: &mut Frame, area1: Rect, area2: Rect, state: &AppState) {
         InputMode::Normal => {
             let msg = if let Some((m, t)) = &state.footer_message {
                 if t.elapsed() < std::time::Duration::from_secs(2) {
-                    format!(" \u{2714} {}", m)
+                    format!(" * {}", m)
                 } else {
                     format!(
                         " Capturing on {}  |  Network: {}  |  {} packets  |  {}/sec",
@@ -2627,9 +2801,9 @@ fn draw_footer(f: &mut Frame, area1: Rect, area2: Rect, state: &AppState) {
             let ip_hint = if state.ip_compressed { "[I] Full IPs" } else { "[I] Short IPs" };
 
             let k = if state.show_graph {
-                format!(" [Tab] Switch Panel  [\u{2191}\u{2193}] Scroll  [Alt+S] Scan  [A] Auto-Scan  [G] Graph  [N] Select Node  [Esc] Clear  [E] Export  {}  [W] Whitelist IP  {} ", f_key_text, ip_hint)
+                format!(" [Tab] Switch Panel  [Arrows] Scroll  [Alt+S] Scan  [A] Auto-Scan  [G] Graph  [N] Select Node  [Esc] Clear  [E] Export  {}  [W] Whitelist IP  {} ", f_key_text, ip_hint)
             } else {
-                format!(" [Tab] Switch Panel  [\u{2191}\u{2193}] Scroll  [Alt+S] Scan  [A] Auto-Scan  [G] Graph  [Space] Resume  [E] Export  {}  [W] Whitelist IP  {} ", f_key_text, ip_hint)
+                format!(" [Tab] Switch Panel  [Arrows] Scroll  [Alt+S] Scan  [A] Auto-Scan  [G] Graph  [Space] Resume  [E] Export  {}  [W] Whitelist IP  {} ", f_key_text, ip_hint)
             };
             (msg, k)
         }
@@ -2773,12 +2947,12 @@ fn draw_graph(f: &mut Frame, area: Rect, state: &AppState) {
                 };
 
                 // Use a larger symbol for active traffic
-                let mut symbol = if active_traffic { "◉".to_string() } else { "●".to_string() };
+                let mut symbol = if active_traffic { "@".to_string() } else { "o".to_string() };
                 
                 // Highlight selected node with prominent arrows
                 let mut dot_x = node.x;
                 if state.selected_node == Some(*ip) {
-                    symbol = format!("►{}◄", symbol);
+                    symbol = format!(">{}<", symbol);
                     dot_x -= units_per_col * 2.0; // Shift left to center the arrows properly
                     // Make the label pop more for the selected node
                     ctx.print(dot_x, node.y - units_per_row * 2.0, ratatui::text::Span::styled("~~~~~", Style::default().fg(Color::Yellow)));
@@ -2869,28 +3043,28 @@ fn draw_graph(f: &mut Frame, area: Rect, state: &AppState) {
             let legend_y = -178.0;
             // "LOCAL" entry — green dot + green label
             ctx.print(-330.0, legend_y, ratatui::text::Span::styled(
-                "●", Style::default().fg(Color::Green)
+                "o", Style::default().fg(Color::Green)
             ));
             ctx.print(-320.0, legend_y, ratatui::text::Span::styled(
                 "LOCAL", Style::default().fg(Color::Green)
             ));
             // "INTERNET" entry — yellow dot + yellow label
             ctx.print(-268.0, legend_y, ratatui::text::Span::styled(
-                "●", Style::default().fg(Color::Yellow)
+                "o", Style::default().fg(Color::Yellow)
             ));
             ctx.print(-258.0, legend_y, ratatui::text::Span::styled(
                 "INTERNET", Style::default().fg(Color::Yellow)
             ));
             // "ACTIVE" entry — white ring + white label
             ctx.print(-190.0, legend_y, ratatui::text::Span::styled(
-                "◉", Style::default().fg(Color::White)
+                "@", Style::default().fg(Color::White)
             ));
             ctx.print(-180.0, legend_y, ratatui::text::Span::styled(
                 "ACTIVE", Style::default().fg(Color::White)
             ));
             // "ALERT" entry — red dot + red label
             ctx.print(-118.0, legend_y, ratatui::text::Span::styled(
-                "●", Style::default().fg(Color::Red)
+                "o", Style::default().fg(Color::Red)
             ));
             ctx.print(-108.0, legend_y, ratatui::text::Span::styled(
                 "ALERT", Style::default().fg(Color::Red)
@@ -3020,15 +3194,24 @@ fn draw_graph(f: &mut Frame, area: Rect, state: &AppState) {
                     ));
                 }
                 // Services
-                if let Some(svcs) = dev_meta.get("services") {
+                if !dev_meta.services.is_empty() {
+                    let mut svcs_vec: Vec<_> = dev_meta.services.iter().cloned().collect();
+                    svcs_vec.sort();
+                    let svcs_str = svcs_vec.join(", ");
                     enriched_details.push(ratatui::widgets::ListItem::new(
-                        format!("{:<10} {}", "Services:", truncate_str(svcs, 24))
+                        format!("{:<10} {}", "Services:", truncate_str(&svcs_str, 24))
                     ));
                 }
                 // Serial (SSDP)
                 if let Some(serial) = dev_meta.get("serial") {
                     enriched_details.push(ratatui::widgets::ListItem::new(
                         format!("{:<10} {}", "Serial:", serial)
+                    ));
+                }
+                // Show device pair note
+                if let Some(note) = dev_meta.get("note") {
+                    enriched_details.push(ratatui::widgets::ListItem::new(
+                        ratatui::text::Span::styled(format!("Note: {}", note), Style::default().fg(Color::Yellow))
                     ));
                 }
             }
@@ -3099,5 +3282,200 @@ fn draw_graph(f: &mut Frame, area: Rect, state: &AppState) {
         // Use clear to avoid background overlapping
         f.render_widget(ratatui::widgets::Clear, popup_area);
         f.render_widget(list, popup_area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet::{CapturedPacket, Protocol};
+    use crate::discovery::DeviceInfo;
+    use std::net::IpAddr;
+
+    #[test]
+    fn test_mdns_leak_detection() {
+        let mut state = AppState::new("test_iface".to_string(), "test_net".to_string());
+
+        // Populate active discovery inventory with a mock device matching the source IP
+        let src_ip = "192.168.1.50".parse::<IpAddr>().unwrap();
+        let mock_device = DeviceInfo {
+            mac: "00:11:22:33:44:55".to_string(),
+            vendor: "eero Inc.".to_string(),
+            hostname: "eero-mesh-node".to_string(),
+            miss_count: 0,
+            last_seen: std::time::Instant::now(),
+            last_seen_unix: crate::discovery::default_unix_now(),
+        };
+        {
+            let mut active = state.active_discovery.lock().unwrap();
+            active.insert(src_ip, mock_device);
+        }
+
+        // Test Case 1: Normal local mDNS query (destination is multicast 224.0.0.251)
+        let normal_pkt = CapturedPacket {
+            timestamp: chrono::Local::now(),
+            protocol: Protocol::Udp,
+            src_ip,
+            dst_ip: "224.0.0.251".parse::<IpAddr>().unwrap(),
+            src_port: Some(5353),
+            dst_port: Some(5353),
+            size: 100,
+            flags: None,
+            payload: None,
+            ttl: Some(64),
+            tcp_window: None,
+            dns_answers: None,
+            domain_hint: None,
+            tls_fingerprint: None,
+            dhcp_fingerprint: None,
+            process: Some("dns-responder".to_string()),
+        };
+
+        state.ingest_packet(&normal_pkt);
+        
+        // Normal multicast mDNS should NOT trigger a Suspicious alert
+        assert!(state.alerts_suspicious.is_empty(), "Local multicast mDNS should not trigger an alert");
+
+        // Test Case 2: Leaking mDNS query to a public IP (e.g. 8.8.8.8)
+        let leak_pkt = CapturedPacket {
+            timestamp: chrono::Local::now(),
+            protocol: Protocol::Udp,
+            src_ip,
+            dst_ip: "8.8.8.8".parse::<IpAddr>().unwrap(),
+            src_port: Some(5353),
+            dst_port: Some(5353),
+            size: 100,
+            flags: None,
+            payload: None,
+            ttl: Some(64),
+            tcp_window: None,
+            dns_answers: None,
+            domain_hint: None,
+            tls_fingerprint: None,
+            dhcp_fingerprint: None,
+            process: Some("eero-daemon".to_string()),
+        };
+
+        state.ingest_packet(&leak_pkt);
+
+        // Should trigger exactly one Suspicious alert
+        assert_eq!(state.alerts_suspicious.len(), 1, "mDNS leak to public IP should trigger a Suspicious alert");
+        let alert = &state.alerts_suspicious[0];
+        assert_eq!(alert.reason, AlertReason::MdnsLeak);
+        assert!(alert.message.contains("mDNS Leak — LAN discovery protocol sent to public internet"));
+        assert!(alert.message.contains("eero-mesh-node"));
+        assert!(alert.message.contains("00:11:22:33:44:55"));
+        assert!(alert.message.contains("eero Inc."));
+        assert!(alert.message.contains("eero-daemon"));
+        assert!(alert.message.contains("8.8.8.8:5353"));
+
+        // Test Case 3: Link-local mDNS query (destination is link-local 169.254.10.20)
+        let link_local_pkt = CapturedPacket {
+            timestamp: chrono::Local::now(),
+            protocol: Protocol::Udp,
+            src_ip,
+            dst_ip: "169.254.10.20".parse::<IpAddr>().unwrap(),
+            src_port: Some(5353),
+            dst_port: Some(5353),
+            size: 100,
+            flags: None,
+            payload: None,
+            ttl: Some(64),
+            tcp_window: None,
+            dns_answers: None,
+            domain_hint: None,
+            tls_fingerprint: None,
+            dhcp_fingerprint: None,
+            process: Some("dns-responder".to_string()),
+        };
+
+        state.ingest_packet(&link_local_pkt);
+
+        // Link-local mDNS should NOT add any new Suspicious alerts (length remains 1)
+        assert_eq!(state.alerts_suspicious.len(), 1, "Link-local mDNS should not trigger an alert");
+    }
+
+    #[test]
+    fn test_dhcp_leak_and_local_ip() {
+        // 1. Verify is_local_ip supports IPv6 link-local (fe80::1)
+        let local_v6 = "fe80::1".parse::<IpAddr>().unwrap();
+        let public_v6 = "2001:db8::1".parse::<IpAddr>().unwrap();
+        assert!(is_local_ip(&local_v6), "fe80::1 should be local");
+        assert!(!is_local_ip(&public_v6), "2001:db8::1 should be public");
+
+        // 2. Setup AppState with one active device to cross-reference
+        let mut state = AppState::new("test_iface".to_string(), "test_net".to_string());
+        let src_ip = "192.168.1.100".parse::<IpAddr>().unwrap();
+        
+        let device = crate::discovery::DeviceInfo {
+            mac: "00:11:22:33:44:55".to_string(),
+            vendor: "eero Inc.".to_string(),
+            hostname: "eero-mesh-node".to_string(),
+            miss_count: 0,
+            last_seen: std::time::Instant::now(),
+            last_seen_unix: crate::discovery::default_unix_now(),
+        };
+
+        {
+            let mut active = state.active_discovery.lock().unwrap();
+            active.insert(src_ip, device);
+        }
+
+        // Test Case 1: Outbound DHCP server request to a local/broadcast destination (port 67 to 255.255.255.255)
+        let normal_pkt = CapturedPacket {
+            timestamp: chrono::Local::now(),
+            protocol: Protocol::Udp,
+            src_ip,
+            dst_ip: "255.255.255.255".parse::<IpAddr>().unwrap(),
+            src_port: Some(68),
+            dst_port: Some(67),
+            size: 100,
+            flags: None,
+            payload: None,
+            ttl: Some(64),
+            tcp_window: None,
+            dns_answers: None,
+            domain_hint: None,
+            tls_fingerprint: None,
+            dhcp_fingerprint: None,
+            process: Some("dhcp-daemon".to_string()),
+        };
+
+        state.ingest_packet(&normal_pkt);
+        
+        // Normal broadcast DHCP should NOT trigger a Suspicious alert
+        assert!(state.alerts_suspicious.is_empty(), "Normal broadcast DHCP should not trigger a Suspicious alert");
+
+        // Test Case 2: Leaking DHCP request to a public IP (e.g. 4.1.0.2 on port 67)
+        let leak_pkt = CapturedPacket {
+            timestamp: chrono::Local::now(),
+            protocol: Protocol::Udp,
+            src_ip,
+            dst_ip: "4.1.0.2".parse::<IpAddr>().unwrap(),
+            src_port: Some(68),
+            dst_port: Some(67),
+            size: 100,
+            flags: None,
+            payload: None,
+            ttl: Some(64),
+            tcp_window: None,
+            dns_answers: None,
+            domain_hint: None,
+            tls_fingerprint: None,
+            dhcp_fingerprint: None,
+            process: Some("dhcp-daemon".to_string()),
+        };
+
+        state.ingest_packet(&leak_pkt);
+
+        // Should trigger exactly one Suspicious alert
+        assert_eq!(state.alerts_suspicious.len(), 1, "DHCP leak to public IP should trigger a Suspicious alert");
+        let alert = &state.alerts_suspicious[0];
+        assert_eq!(alert.reason, AlertReason::DhcpLeak);
+        assert!(alert.message.contains("DHCP Request to Public IP — possible mesh node misconfiguration or rogue DHCP client"));
+        assert!(alert.message.contains("eero-mesh-node"));
+        assert!(alert.message.contains("00:11:22:33:44:55"));
+        assert!(alert.message.contains("eero Inc."));
+        assert!(alert.message.contains("4.1.0.2:67"));
     }
 }
