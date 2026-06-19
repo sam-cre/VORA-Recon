@@ -131,7 +131,7 @@ Section "VORA-Recon" SecMain
     WriteRegStr HKLM "Software\VoraRecon" "Install_Dir" "$INSTDIR"
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "DisplayName" "VORA-Recon"
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "UninstallString" '"$INSTDIR\Uninstall.exe"'
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "DisplayVersion" "0.4.0"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "DisplayVersion" "2.0.0"
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "Publisher" "Sam Rogers"
     WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "NoModify" 1
     WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VoraRecon" "NoRepair" 1
