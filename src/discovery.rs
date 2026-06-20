@@ -2578,6 +2578,30 @@ fn perform_scan(
             .or_insert(new_entry.clone());
     }
     let found = active_discovery.len();
+
+    // Save baseline immediately before spawning the enrichment thread so that
+    // cancel/restart/quit can never skip this write. The bg_handle will re-save
+    // after hostname enrichment to flush updated names.
+    {
+        let ipv4_macs: std::collections::HashSet<String> = active_discovery.iter()
+            .filter(|r| matches!(r.key(), IpAddr::V4(_)))
+            .map(|r| r.value().mac.clone())
+            .collect();
+        let early_baseline: HashMap<IpAddr, DeviceInfo> = active_discovery.iter()
+            .filter(|r| {
+                let ip = r.key();
+                if !crate::display::is_local_ip(ip) { return false; }
+                if let IpAddr::V6(v6) = ip {
+                    !(v6.segments()[0] == 0xfe80 && ipv4_macs.contains(&r.value().mac))
+                } else {
+                    true
+                }
+            })
+            .map(|r| (*r.key(), r.value().clone()))
+            .collect();
+        save_baseline(network_name, &early_baseline);
+    }
+
     let _ = status_tx.send(format!("Ready ({} discovered)", found));
 
     // Run hostname resolution in background thread

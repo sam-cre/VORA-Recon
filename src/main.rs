@@ -160,18 +160,12 @@ fn run_app(
 
     let mut state = AppState::new(interface_name_label.clone(), current_network.clone());
 
-    // Load device baseline from previous session so devices persist across restarts
+    // Load baseline IPs for [NEW] detection — but don't set scan_has_run so the
+    // warning page shows until the user actually triggers a scan this session.
     {
         let baseline = discovery::load_baseline(&current_network);
-        if !baseline.is_empty() {
-            // Capture baseline IPs before moving the map — used by [NEW] marker
-            for ip in baseline.keys() {
-                state.baseline_ips.insert(*ip);
-            }
-            if let Ok(mut active) = state.active_discovery.lock() {
-                *active = baseline;
-            }
-            state.scan_has_run = true;
+        for ip in baseline.keys() {
+            state.baseline_ips.insert(*ip);
         }
     }
     
@@ -235,6 +229,14 @@ fn run_app(
             // "Ready (N discovered)" signals the scan finished — gate [NEW] display
             if status.starts_with("Ready (") {
                 state.fresh_scan_done = true;
+                // Merge all currently-known devices into baseline_ips so they won't
+                // be marked [NEW] on the next scan in this session (or after restart,
+                // which is already handled by save_baseline writing to disk).
+                if let Ok(active) = state.active_discovery.lock() {
+                    for ip in active.keys() {
+                        state.baseline_ips.insert(*ip);
+                    }
+                }
             }
             state.discovery_status = status;
             state.last_discovery_time = chrono::Local::now().format("%H:%M:%S").to_string();
